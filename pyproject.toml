@@ -1,0 +1,10 @@
+[project]
+name = "comfyui-moss-nara"
+version = "0.1.0"
+description = "NaRA (noise-aware rank adaptation) loader and sigma-aware KSampler for MOSS-Image in ComfyUI"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "MOSS-Image NaRA"
