@@ -36,8 +36,15 @@ def _map_layers(model, layers):
 
 
 def _check_moss(model):
-    if not isinstance(model.model, comfy.model_base.MOSSImage):
-        raise ValueError("NaRA nodes expect a MOSS-Image model")
+    base = model.model
+    if isinstance(base, comfy.model_base.MOSSImage):
+        return
+    # The standalone moss-image loaders define their own MOSSImage(BaseModel) beside the
+    # core one: same weights and layer names, different class object, so isinstance fails.
+    diffusion = getattr(base, "diffusion_model", None)
+    if type(base).__name__ == "MOSSImage" and hasattr(diffusion, "video_embedder") and hasattr(diffusion, "layers"):
+        return
+    raise ValueError("NaRA nodes expect a MOSS-Image model")
 
 
 class MossNaraLoader(io.ComfyNode):
