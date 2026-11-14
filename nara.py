@@ -3,9 +3,12 @@
 h = W0 x + s B C(sigma) A x, with C(sigma) = I + c_scale F(e_sigma) produced by one
 shared hypernetwork. Runs as a bypass weight adapter: base weights (including
 quantized ones) are never modified, the sigma-dependent path is added in forward.
+LoHa / LoKr variants carry the core in their rank factors the same way the trainer
+does; DoRA normalizes after the live BA*C(sigma), per forward, in fp32.
 """
 
 import json
+import os
 
 import torch
 import torch.nn.functional as F
@@ -13,10 +16,18 @@ from safetensors import safe_open
 from torch import nn
 
 import comfy.model_management
+import comfy.ops
 from comfy.weight_adapter.base import WeightAdapterBase
 
 EMBEDS = ("fourier", "mlp", "raw")
 HYPER_STEM = "nara_hyper"
+
+# Per-layer tensor names of the trainer's NaRA exports (lycoris / raw state).
+LORA_NAMES = ("lora_up.weight", "lora_down.weight")
+LOHA_NAMES = ("hada_w1_a", "hada_w1_b", "hada_w2_a", "hada_w2_b")
+LOKR_NAMES = ("lokr_w1", "lokr_w1_a", "lokr_w1_b", "lokr_w2", "lokr_w2_a", "lokr_w2_b")
+COMMON_NAMES = ("alpha", "dora_scale")
+NARA_NAMES = LORA_NAMES + LOHA_NAMES + LOKR_NAMES + COMMON_NAMES
 
 
 class NaraHyper(nn.Module):
@@ -85,28 +96,116 @@ def hyper_from(tensors, meta):
     return hyper
 
 
-def load_nara(path):
-    """(hypernetwork, [(lora key, up, down, alpha)]) from a NaRA safetensors file."""
+def read_adapter(path):
+    """(tensors, metadata) of an adapter file, on CPU."""
     with safe_open(path, framework="pt", device="cpu") as f:
         meta = f.metadata() or {}
-        keys = list(f.keys())
-        prefix = HYPER_STEM + "."
-        hyper_tensors = {k[len(prefix):]: f.get_tensor(k) for k in keys if k.startswith(prefix)}
-        if not hyper_tensors:
-            raise ValueError(
-                f"{path}: no {HYPER_STEM}.* tensors; a fixed-sigma NaRA export is a plain LoRA, load it with LoraLoader"
-            )
-        layers = []
-        for k in keys:
-            if not k.endswith(".lora_up.weight"):
-                continue
-            stem = k[: -len(".lora_up.weight")]
-            up = f.get_tensor(k)
-            down = f.get_tensor(stem + ".lora_down.weight")
-            alpha_name = stem + ".alpha"
-            alpha = f.get_tensor(alpha_name).item() if alpha_name in keys else None
-            layers.append((stem, up, down, alpha))
-    return hyper_from(hyper_tensors, meta), layers
+        tensors = {k: f.get_tensor(k) for k in f.keys()}
+    return tensors, meta
+
+
+def normalize_ema(tensors, meta, path):
+    """An EMA checkpoint's tensors carry an `ema<decay>/` prefix and no metadata:
+    strip it, and take the configuration plus the hypernetwork's fixed buffers
+    (fourier_w is never averaged) from the sibling trainable.safetensors. A copy
+    with the metadata and buffers already embedded needs no sibling."""
+    prefixed = [k for k in tensors if k.startswith("ema") and "/" in k]
+    if not prefixed:
+        return tensors, meta
+    prefix = prefixed[0].split("/", 1)[0] + "/"
+    stripped = {k[len(prefix):]: v for k, v in tensors.items() if k.startswith(prefix)}
+    have_meta = bool(meta.get("kohakumoss_spec") or meta.get("ss_network_args"))
+    sibling = os.path.join(os.path.dirname(path), "trainable.safetensors")
+    if not have_meta and not os.path.isfile(sibling):
+        raise ValueError(f"{path}: an EMA state without metadata needs its sibling trainable.safetensors")
+    if os.path.isfile(sibling):
+        with safe_open(sibling, framework="pt", device="cpu") as f:
+            if not have_meta:
+                meta = f.metadata() or {}
+            for k in f.keys():
+                if k.startswith(HYPER_STEM + ".") and k not in stripped:
+                    stripped[k] = f.get_tensor(k)
+    return stripped, meta
+
+
+def split_hyper(tensors):
+    """(hypernetwork tensors under their own names, the per-layer tensors)."""
+    prefix = HYPER_STEM + "."
+    hyper = {k[len(prefix):]: v for k, v in tensors.items() if k.startswith(prefix)}
+    rest = {k: v for k, v in tensors.items() if not k.startswith(prefix)}
+    return hyper, rest
+
+
+def group_nara_layers(tensors):
+    """stem -> {tensor name: tensor} of the per-layer NaRA tensors."""
+    layers = {}
+    for k, v in tensors.items():
+        for name in NARA_NAMES:
+            suffix = "." + name
+            if k.endswith(suffix):
+                layers.setdefault(k[: -len(suffix)], {})[name] = v
+                break
+    return layers
+
+
+def variant_of(parts):
+    """The NaRA variant of one layer's tensor set."""
+    if "lora_up.weight" in parts:
+        return "lora"
+    if "hada_w1_a" in parts:
+        return "loha"
+    if parts.keys() & {"lokr_w1", "lokr_w1_a", "lokr_w2_a"}:
+        if "lokr_w2" in parts:
+            raise ValueError("NaRA LoKr needs a factorized w2 (lokr_w2_a / lokr_w2_b)")
+        return "lokr"
+    raise KeyError(f"no NaRA variant matches {sorted(parts)}")
+
+
+def rank_of(variant, parts):
+    if variant == "lora":
+        return parts["lora_down.weight"].shape[0]
+    if variant == "loha":
+        return parts["hada_w1_b"].shape[0]
+    return parts["lokr_w2_b"].shape[0]
+
+
+def part_delta(variant, parts, core, scale, dtype):
+    """One layer's dense dW at the given core, in `dtype` (fp32 for the DoRA norm)."""
+    if variant == "lora":
+        up = parts["lora_up.weight"].to(dtype)
+        down = parts["lora_down.weight"].to(dtype)
+        return (up @ core.T @ down) * scale
+    if variant == "loha":
+        w1a, w1b = parts["hada_w1_a"].to(dtype), parts["hada_w1_b"].to(dtype)
+        w2a, w2b = parts["hada_w2_a"].to(dtype), parts["hada_w2_b"].to(dtype)
+        return ((w1a @ core.T @ w1b) * (w2a @ core.T @ w2b)) * scale
+    w1 = (
+        parts["lokr_w1"].to(dtype)
+        if "lokr_w1" in parts
+        else parts["lokr_w1_a"].to(dtype) @ parts["lokr_w1_b"].to(dtype)
+    )
+    w2 = parts["lokr_w2_a"].to(dtype) @ core.T @ parts["lokr_w2_b"].to(dtype)
+    return torch.kron(w1, w2) * scale
+
+
+def bake_tensors(variant, parts, core):
+    """The fixed-sigma plain-adapter tensors: the core folded into the up factors
+    (the trainer's comfy export rule), alpha and dora_scale carried over."""
+    out = {k: v for k, v in parts.items() if k in COMMON_NAMES}
+    if variant == "lora":
+        out["lora_up.weight"] = parts["lora_up.weight"].float() @ core.T
+        out["lora_down.weight"] = parts["lora_down.weight"]
+    elif variant == "loha":
+        out["hada_w1_a"] = parts["hada_w1_a"].float() @ core.T
+        out["hada_w1_b"] = parts["hada_w1_b"]
+        out["hada_w2_a"] = parts["hada_w2_a"].float() @ core.T
+        out["hada_w2_b"] = parts["hada_w2_b"]
+    else:
+        for name in ("lokr_w1", "lokr_w1_a", "lokr_w1_b", "lokr_w2_b"):
+            if name in parts:
+                out[name] = parts[name]
+        out["lokr_w2_a"] = parts["lokr_w2_a"].float() @ core.T
+    return out
 
 
 # The sampling sigma of the current model evaluation, set by the NaRA KSampler's
@@ -131,31 +230,90 @@ def _core(hyper, sigma):
 
 
 class NaraAdapter(WeightAdapterBase):
-    """NaRA over one weight: `parts` are (offset, alpha, up, down) per adapted slice
-    (a fused qkv weight carries three). `weights` holds the (up, down) pairs flat so
-    BypassForwardHook moves them to the compute device; parts index into it."""
+    """NaRA over one weight: `parts` are (offset, alpha, {name: tensor}, dora_scale)
+    per adapted slice (a fused qkv weight carries three). `weights` holds every
+    tensor flat so BypassForwardHook moves them to the compute device; parts index
+    into it. DoRA reads the base weight per forward and normalizes after the live
+    core, in fp32 — no static-BA norm cache."""
 
     name = "nara"
 
-    def __init__(self, loaded_keys, parts, hyper, export_sigma=0.5):
+    def __init__(self, loaded_keys, parts, hyper, variant, export_sigma=0.5):
         self.loaded_keys = loaded_keys
-        self.parts = parts
         self.hyper = hyper
+        self.variant = variant
         self.export_sigma = float(export_sigma)
-        self.weights = tuple(t for _, _, up, down in parts for t in (up, down))
+        self.weights = tuple(t for _, _, ts, ds in parts for t in list(ts.values()) + ([ds] if ds is not None else []))
+        self.parts = []
+        i = 0
+        for offset, alpha, ts, ds in parts:
+            idx = {name: i + j for j, name in enumerate(ts)}
+            i += len(ts)
+            dora_idx = None if ds is None else i
+            if ds is not None:
+                i += 1
+            self.parts.append((offset, alpha, idx, dora_idx))
+        self.has_dora = any(d is not None for _, _, _, d in self.parts)
+        self.wd_on_out = True
+        if self.has_dora:
+            ds = self.weights[next(d for _, _, _, d in self.parts if d is not None)]
+            out_features = self._out_features(parts[0])
+            in_features = self._in_features(parts[0])
+            if ds.shape[0] == out_features:
+                self.wd_on_out = True
+            elif ds.numel() == in_features:
+                self.wd_on_out = False
+            else:
+                raise ValueError(f"dora_scale shape {tuple(ds.shape)} matches neither axis ({out_features}, {in_features})")
+
+    @staticmethod
+    def _out_features(part):
+        offset, _, ts, _ = part
+        if offset is not None:
+            return offset[2]
+        if "lora_up.weight" in ts:
+            return ts["lora_up.weight"].shape[0]
+        if "hada_w1_a" in ts:
+            return ts["hada_w1_a"].shape[0]
+        w1 = ts["lokr_w1"] if "lokr_w1" in ts else ts["lokr_w1_a"]
+        return w1.shape[0] * ts["lokr_w2_a"].shape[0]
+
+    @staticmethod
+    def _in_features(part):
+        _, _, ts, _ = part
+        if "lora_down.weight" in ts:
+            return ts["lora_down.weight"].shape[1]
+        if "hada_w1_b" in ts:
+            return ts["hada_w1_b"].shape[1]
+        w1 = ts["lokr_w1"] if "lokr_w1" in ts else ts["lokr_w1_a"]
+        return w1.shape[1] * ts["lokr_w2_b"].shape[1]
+
+    def _tensors(self, idx):
+        return {name: self.weights[i] for name, i in idx.items()}
+
+    def _scale(self, alpha, ts):
+        return 1.0 if alpha is None else alpha / rank_of(self.variant, ts)
+
+    def _delta(self, x, ts, core, scale):
+        """The slice's bypass delta in x's dtype (LoRA keeps the factorized chain)."""
+        core_x = core.to(x.dtype)
+        if self.variant == "lora":
+            up = ts["lora_up.weight"].to(x.dtype)
+            down = ts["lora_down.weight"].to(x.dtype)
+            hidden = F.linear(x, down) @ core_x
+            return F.linear(hidden, up) * scale
+        dw = part_delta(self.variant, ts, core_x, scale, x.dtype)
+        return F.linear(x, dw)
 
     def h(self, x, base_out):
         if _sigma is None:
             raise RuntimeError("NaRA: no sampling sigma set; sample with the NaRA KSampler")
-        core = _core(self.hyper, _sigma).to(device=x.device, dtype=x.dtype)
-        multiplier = getattr(self, "multiplier", 1.0)
+        core = _core(self.hyper, _sigma)
+        m = getattr(self, "multiplier", 1.0)
         out = None
-        for i, (offset, alpha, _, _) in enumerate(self.parts):
-            up = self.weights[2 * i].to(x.dtype)
-            down = self.weights[2 * i + 1].to(x.dtype)
-            scale = (alpha / down.shape[0] if alpha is not None else 1.0) * multiplier
-            hidden = F.linear(x, down) @ core
-            delta = F.linear(hidden, up) * scale
+        for offset, alpha, idx, _ in self.parts:
+            ts = self._tensors(idx)
+            delta = self._delta(x, ts, core, self._scale(alpha, ts) * m)
             if offset is None:
                 out = delta if out is None else out + delta
             else:
@@ -164,17 +322,82 @@ class NaraAdapter(WeightAdapterBase):
                 out.narrow(-1, offset[1], offset[2]).add_(delta)
         return out
 
+    def bypass_forward(self, org_forward, x, *args, **kwargs):
+        if not self.has_dora:
+            base_out = org_forward(x, *args, **kwargs)
+            return base_out + self.h(x, base_out)
+        if _sigma is None:
+            raise RuntimeError("NaRA: no sampling sigma set; sample with the NaRA KSampler")
+        core = _core(self.hyper, _sigma)
+        m = getattr(self, "multiplier", 1.0)
+        # org_forward may be another bypass hook when adapters stack; the DoRA
+        # norm reads the raw module's weight (earlier deltas are not folded in)
+        module = org_forward.__self__
+        while not hasattr(module, "weight") and hasattr(module, "original_forward"):
+            module = module.original_forward.__self__
+        w, bias, stream = comfy.ops.cast_bias_weight(module, input=x, dtype=torch.float32, offloadable=True)
+        try:
+            if self.wd_on_out:
+                return self._dora_out(org_forward, x, w, bias, core, m, args, kwargs)
+            return self._dora_in(org_forward, x, w, core, m, args, kwargs)
+        finally:
+            comfy.ops.uncast_bias_weight(module, w, bias, stream)
+
+    def _dora_out(self, org_forward, x, w, bias, core, m, args, kwargs):
+        """y + m ((r - 1) Wx + r dy), r = mag / ||W + dW(sigma)|| per output row."""
+        y = org_forward(x, *args, **kwargs)
+        eps = torch.finfo(torch.float32).eps
+        ratios, deltas = [], []
+        for offset, alpha, idx, dora_idx in self.parts:
+            ts = self._tensors(idx)
+            scale = self._scale(alpha, ts)
+            dw = part_delta(self.variant, ts, core, scale, torch.float32)
+            wp = w if offset is None else w.narrow(0, offset[1], offset[2])
+            norm = (wp + dw).reshape(wp.shape[0], -1).norm(dim=1) + eps
+            ratios.append(self.weights[dora_idx].float().reshape(-1).to(norm.device) / norm)
+            deltas.append(self._delta(x, ts, core, scale))
+        ratio = torch.cat(ratios) if len(ratios) > 1 else ratios[0]
+        dy = torch.cat(deltas, dim=-1) if len(deltas) > 1 else deltas[0]
+        yf = y.float()
+        wx = yf if bias is None else yf - bias.float()
+        out = yf + m * ((ratio - 1) * wx + ratio * dy.float())
+        return out.to(y.dtype)
+
+    def _dora_in(self, org_forward, x, w, core, m, args, kwargs):
+        """W'x = (W + dW)(c x), c = mag / ||W + dW(sigma)|| per input column; one
+        scaled-input base forward per slice (fused qkv slices scale differently)."""
+        y = org_forward(x, *args, **kwargs)
+        eps = torch.finfo(torch.float32).eps
+        out = y.float()
+        for offset, alpha, idx, dora_idx in self.parts:
+            ts = self._tensors(idx)
+            scale = self._scale(alpha, ts)
+            dw = part_delta(self.variant, ts, core, scale, torch.float32)
+            wp = w if offset is None else w.narrow(0, offset[1], offset[2])
+            norm = (wp + dw).norm(dim=0) + eps
+            c = self.weights[dora_idx].float().reshape(-1).to(norm.device) / norm
+            xc = (x.float() * c).to(x.dtype)
+            yc = org_forward(xc, *args, **kwargs)
+            dy = self._delta(xc, ts, core, scale)
+            if offset is None:
+                out = out + m * (yc.float() + dy.float() - y.float())
+            else:
+                sl = slice(offset[1], offset[1] + offset[2])
+                out[..., sl] += m * (yc[..., sl].float() + dy[..., sl].float() - y[..., sl].float())
+        return out.to(y.dtype)
+
     def calculate_weight(self, weight, key, strength, strength_model, offset, function, intermediate_dtype=torch.float32, original_weight=None):
-        """Merge mode: NaRA at the fixed export_sigma as a plain LoRA diff."""
+        """Merge mode: NaRA at the fixed export_sigma as a plain adapter diff. DoRA
+        merges through the Bake node (its magnitude needs the base weight)."""
+        if self.has_dora:
+            raise ValueError("NaRA+DoRA cannot merge directly; use NaRA Bake (fixed sigma)")
         device = weight.device
         hyper_device = next(self.hyper.parameters()).device
         s = torch.tensor([self.export_sigma], device=hyper_device, dtype=torch.float32)
         core = self.hyper(s)[0].to(device=device, dtype=intermediate_dtype)
-        for i, (off, alpha, _, _) in enumerate(self.parts):
-            up = comfy.model_management.cast_to_device(self.weights[2 * i], device, intermediate_dtype)
-            down = comfy.model_management.cast_to_device(self.weights[2 * i + 1], device, intermediate_dtype)
-            w = weight if off is None else weight.narrow(*off)
-            scale = alpha / down.shape[0] if alpha is not None else 1.0
-            diff = (up @ core.T) @ down
-            w += function((strength * scale * diff).type(w.dtype))
+        for off, alpha, idx, _ in self.parts:
+            ts = {name: comfy.model_management.cast_to_device(t, device, intermediate_dtype) for name, t in self._tensors(idx).items()}
+            diff = part_delta(self.variant, ts, core, self._scale(alpha, ts), intermediate_dtype)
+            wp = weight if off is None else weight.narrow(*off)
+            wp += function((strength * diff).type(wp.dtype))
         return weight
