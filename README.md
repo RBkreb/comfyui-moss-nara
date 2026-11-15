@@ -31,7 +31,8 @@ C(sigma) = I + c_scale F(e_sigma)
 ## 说明
 
 - 超网络在每个不同的 sigma 上只求值一次，所有层共享；bypass 模式下每层额外开销是
-  一段秩大小的矩阵乘链（DoRA 层另有一次瞬时 fp32 范数）。
+  一段秩大小的矩阵乘链。DoRA 范数用 Gram 展开（fp32）：静态基项（||W||²、W·downᵀ 等）
+  在适配器首次使用时缓存，每步只剩按形状分批的小矩阵乘；输出轴 epilogue 以激活 dtype 运行。
 - `strength_model` 与 LoRA strength 语义一致；DoRA 的 multiplier 插值与 trainer 相同。
 - 同一层堆叠多个 NaRA 时，DoRA 范数读原始基模权重。
 

@@ -233,8 +233,10 @@ class NaraAdapter(WeightAdapterBase):
     """NaRA over one weight: `parts` are (offset, alpha, {name: tensor}, dora_scale)
     per adapted slice (a fused qkv weight carries three). `weights` holds every
     tensor flat so BypassForwardHook moves them to the compute device; parts index
-    into it. DoRA reads the base weight per forward and normalizes after the live
-    core, in fp32 — no static-BA norm cache."""
+    into it. DoRA normalizes after the live core in fp32 through the Gram expansion
+    of ||W + dW(sigma)||; the static base terms (||W||^2, W down^T / W^T up and the
+    factor Gram) are cached per adapter at first use, so a step only runs r x r
+    matmuls. LoHa / LoKr keep the dense per-forward norm."""
 
     name = "nara"
 
@@ -265,6 +267,7 @@ class NaraAdapter(WeightAdapterBase):
                 self.wd_on_out = False
             else:
                 raise ValueError(f"dora_scale shape {tuple(ds.shape)} matches neither axis ({out_features}, {in_features})")
+        self._norm_cache = None
 
     @staticmethod
     def _out_features(part):
@@ -335,16 +338,125 @@ class NaraAdapter(WeightAdapterBase):
         module = org_forward.__self__
         while not hasattr(module, "weight") and hasattr(module, "original_forward"):
             module = module.original_forward.__self__
+        if self.variant == "lora":
+            if self.wd_on_out:
+                return self._dora_out(org_forward, x, module, core, m, args, kwargs)
+            return self._dora_in(org_forward, x, module, core, m, args, kwargs)
         w, bias, stream = comfy.ops.cast_bias_weight(module, input=x, dtype=torch.float32, offloadable=True)
         try:
             if self.wd_on_out:
-                return self._dora_out(org_forward, x, w, bias, core, m, args, kwargs)
-            return self._dora_in(org_forward, x, w, core, m, args, kwargs)
+                return self._dora_out_dense(org_forward, x, w, bias, core, m, args, kwargs)
+            return self._dora_in_dense(org_forward, x, w, core, m, args, kwargs)
         finally:
             comfy.ops.uncast_bias_weight(module, w, bias, stream)
 
-    def _dora_out(self, org_forward, x, w, bias, core, m, args, kwargs):
-        """y + m ((r - 1) Wx + r dy), r = mag / ||W + dW(sigma)|| per output row."""
+    def _statics(self, module, device):
+        """The frozen base terms of the Gram expansion, fp32, grouped by slice shape
+        so a step batches them: per group (W down^T, up, down down^T, ||W||^2, mag)
+        on the output axis or (W^T up, down, up^T up, ||W||^2, mag) on the input
+        axis, plus each part's span in the group-flattened ratio vector. One dequant
+        at first use serves every step; rebuilt if the device moves."""
+        cache = self._norm_cache
+        if cache is not None and cache[0] == device:
+            return cache[1], cache[2]
+        w, bias, stream = comfy.ops.cast_bias_weight(module, dtype=torch.float32, device=device, offloadable=True)
+        try:
+            groups = {}
+            for pi, (offset, _, idx, dora_idx) in enumerate(self.parts):
+                ts = self._tensors(idx)
+                wp = w if offset is None else w.narrow(0, offset[1], offset[2])
+                mag = self.weights[dora_idx].to(device=device, dtype=torch.float32).reshape(-1)
+                if self.wd_on_out:
+                    up = ts["lora_up.weight"].to(device=device, dtype=torch.float32)
+                    down = ts["lora_down.weight"].to(device=device, dtype=torch.float32)
+                    entry = (wp @ down.T, up, down @ down.T, (wp * wp).sum(dim=1), mag)
+                else:
+                    up = ts["lora_up.weight"].to(device=device, dtype=torch.float32)
+                    down = ts["lora_down.weight"].to(device=device, dtype=torch.float32)
+                    entry = (wp.T @ up, down, up.T @ up, (wp * wp).sum(dim=0), mag)
+                groups.setdefault(entry[0].shape, []).append((pi, entry))
+        finally:
+            comfy.ops.uncast_bias_weight(module, w, bias, stream)
+        stacked, spans, pos = [], [None] * len(self.parts), 0
+        for items in groups.values():
+            tensors = [torch.stack([e[i] for _, e in items]) for i in range(5)]
+            rows = tensors[0].shape[1]
+            for j, (pi, _) in enumerate(items):
+                spans[pi] = (pos + j * rows, rows)
+            pos += len(items) * rows
+            stacked.append(tuple(tensors))
+        self._norm_cache = (device, stacked, spans)
+        return stacked, spans
+
+    def _norms(self, module, device, core):
+        """mag / ||W + dW(sigma)|| per DoRA row, fp32, batched per shape group:
+        ||W + dW||^2 = ||W||^2 + 2<W, dW> + ||dW||^2 with the live core."""
+        eps = torch.finfo(torch.float32).eps
+        groups, spans = self._statics(module, device)
+        flat = []
+        for a, b, g, base2, mag in groups:
+            if self.wd_on_out:
+                gram = core.T @ g @ core
+                u = b @ gram
+                cross = ((a @ core) * b).sum(-1)
+                delta = (u * b).sum(-1)
+            else:
+                cross = ((core @ a.transpose(1, 2)) * b).sum(1)
+                gram = core @ g @ core.T
+                delta = ((b.transpose(1, 2) @ gram) * b.transpose(1, 2)).sum(-1)
+            norm = (base2 + 2 * cross + delta).clamp_min(0).sqrt() + eps
+            flat.append((mag / norm).reshape(-1))
+        flat = torch.cat(flat)
+        return [flat[s : s + n] for s, n in spans]
+
+    def _dora_out(self, org_forward, x, module, core, m, args, kwargs):
+        """y + m ((r - 1) Wx + r dy), r = mag / ||W + dW(sigma)|| per output row.
+        The norm is fp32; the epilogue runs in the activation dtype with r folded
+        into a row scale on y and on the up factor (the output is rounded to that
+        dtype anyway)."""
+        y = org_forward(x, *args, **kwargs)
+        ratios = self._norms(module, x.device, core)
+        out = None
+        for (offset, alpha, idx, _), r in zip(self.parts, ratios):
+            ts = self._tensors(idx)
+            scale = self._scale(alpha, ts)
+            a = (1 + m * (r - 1)).to(y.dtype)
+            b = (m * r).to(y.dtype)
+            up = ts["lora_up.weight"] * b.to(ts["lora_up.weight"].dtype).reshape(-1, 1)
+            dy = self._delta(x, {**ts, "lora_up.weight": up}, core, scale)
+            ys = y if offset is None else y.narrow(-1, offset[1], offset[2])
+            part = ys * a + dy
+            if module.bias is not None:
+                bs = module.bias if offset is None else module.bias.narrow(0, offset[1], offset[2])
+                part = part - (m * (r - 1)).to(y.dtype) * bs.to(y.dtype)
+            if offset is None:
+                out = part if out is None else out + part
+            else:
+                if out is None:
+                    out = torch.zeros_like(y)
+                out.narrow(-1, offset[1], offset[2]).add_(part)
+        return out
+
+    def _dora_in(self, org_forward, x, module, core, m, args, kwargs):
+        """W'x = (W + dW)(c x), c = mag / ||W + dW(sigma)|| per input column; one
+        scaled-input base forward per slice (fused qkv slices scale differently)."""
+        y = org_forward(x, *args, **kwargs)
+        out = y.float()
+        for (offset, alpha, idx, _), c in zip(self.parts, self._norms(module, x.device, core)):
+            ts = self._tensors(idx)
+            scale = self._scale(alpha, ts)
+            xc = (x.float() * c).to(x.dtype)
+            yc = org_forward(xc, *args, **kwargs)
+            dy = self._delta(xc, ts, core, scale)
+            if offset is None:
+                out = out + m * (yc.float() + dy.float() - y.float())
+            else:
+                sl = slice(offset[1], offset[1] + offset[2])
+                out[..., sl] += m * (yc[..., sl].float() + dy.float() - y[..., sl].float())
+        return out.to(y.dtype)
+
+    def _dora_out_dense(self, org_forward, x, w, bias, core, m, args, kwargs):
+        """LoHa / LoKr output axis: dense dW, one fp32 base read per forward."""
         y = org_forward(x, *args, **kwargs)
         eps = torch.finfo(torch.float32).eps
         ratios, deltas = [], []
@@ -363,9 +475,8 @@ class NaraAdapter(WeightAdapterBase):
         out = yf + m * ((ratio - 1) * wx + ratio * dy.float())
         return out.to(y.dtype)
 
-    def _dora_in(self, org_forward, x, w, core, m, args, kwargs):
-        """W'x = (W + dW)(c x), c = mag / ||W + dW(sigma)|| per input column; one
-        scaled-input base forward per slice (fused qkv slices scale differently)."""
+    def _dora_in_dense(self, org_forward, x, w, core, m, args, kwargs):
+        """LoHa / LoKr input axis: dense dW, one fp32 base read per forward."""
         y = org_forward(x, *args, **kwargs)
         eps = torch.finfo(torch.float32).eps
         out = y.float()
@@ -383,7 +494,7 @@ class NaraAdapter(WeightAdapterBase):
                 out = out + m * (yc.float() + dy.float() - y.float())
             else:
                 sl = slice(offset[1], offset[1] + offset[2])
-                out[..., sl] += m * (yc[..., sl].float() + dy[..., sl].float() - y[..., sl].float())
+                out[..., sl] += m * (yc[..., sl].float() + dy.float() - y[..., sl].float())
         return out.to(y.dtype)
 
     def calculate_weight(self, weight, key, strength, strength_model, offset, function, intermediate_dtype=torch.float32, original_weight=None):
