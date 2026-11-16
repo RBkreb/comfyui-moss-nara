@@ -226,7 +226,7 @@ def _baked_dora_scale(model, weight_key, offset, dw, dora):
         row = wp.reshape(wp.shape[0], -1)
         merged = row + dw.to(row.device).reshape(row.shape)
         ratio = (row.norm(dim=1) + eps) / (merged.norm(dim=1) + eps)
-        return dora.float() * ratio.to(dora.device)
+        return dora.float() * ratio.to(dora.device).reshape(dora.shape)
     finally:
         comfy.ops.uncast_bias_weight(module, w, bias, stream)
 
