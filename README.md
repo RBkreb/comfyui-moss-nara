@@ -20,7 +20,8 @@ C(sigma) = I + c_scale F(e_sigma)
 | 节点 | 作用 |
 |------|------|
 | **Adapter Loader (MOSS-Image, NaRA auto)** | 自动识别适配器类型：含 `nara_hyper.*` 的文件以 bypass 方式加载；普通 lora/loha/lokr走 ComfyUI 原生 patch |
-| **NaRA KSampler Advanced (MOSS-Image)** | 原生高级 KSampler 的等价物。上游模型含 NaRA 时以每步 sigma 计算超网络；不含 NaRA 时行为与原生 KSamplerAdvanced 完全一致 |
+| **NaRA KSampler (MOSS-Image)** | 原生标准 KSampler 的等价物。上游模型含 NaRA 时以每步 sigma 计算超网络；不含 NaRA 时行为与原生 KSampler 一致 |
+| **NaRA KSampler Advanced (MOSS-Image)** | 原生高级 KSampler 的等价物。上游模型含 NaRA 时以每步 sigma 计算超网络；不含 NaRA 时行为与原生 KSamplerAdvanced 一致 |
 | **Adapter Bake (MOSS-Image, fixed sigma)** | 将 NaRA 在固定 sigma 烘焙成普通适配器：核心折入 up 因子，DoRA 幅度换算为 ComfyUI 的归一化语义 |
 
 用法：`Moss Loader -> Adapter Loader -> NaRA KSampler Advanced`。
@@ -35,6 +36,9 @@ C(sigma) = I + c_scale F(e_sigma)
   在适配器首次使用时缓存，每步只剩按形状分批的小矩阵乘；输出轴 epilogue 以激活 dtype 运行。
 - `strength_model` 与 LoRA strength 语义一致；DoRA 的 multiplier 插值与 trainer 相同。
 - 同一层堆叠多个 NaRA 时，DoRA 范数读原始基模权重。
+
+## 示例
+[DoRA+NaRA](https://huggingface.co/RBXLSP/TextureLux-DoRAN)
 
 ## 参考
 - https://github.com/generaldi/NaRA

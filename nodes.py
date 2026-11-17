@@ -211,6 +211,52 @@ class MossNaraKSamplerAdvanced(io.ComfyNode):
         return io.NodeOutput(out)
 
 
+class MossNaraKSampler(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="MossNara_KSampler",
+            display_name="NaRA KSampler (MOSS-Image)",
+            category="moss_nara",
+            description="ComfyUI's standard KSampler with NaRA support: when the upstream model carries a NaRA adapter, each denoising step's sigma feeds the hypernetwork so the core C(sigma) follows the noise level. Without a NaRA adapter it behaves exactly like the native KSampler.",
+            inputs=[
+                io.Model.Input("model"),
+                io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff, control_after_generate=True),
+                io.Int.Input("steps", default=20, min=1, max=10000),
+                io.Float.Input("cfg", default=8.0, min=0.0, max=100.0, step=0.1, round=0.01),
+                io.Combo.Input("sampler_name", options=comfy.samplers.KSampler.SAMPLERS),
+                io.Combo.Input("scheduler", options=comfy.samplers.KSampler.SCHEDULERS),
+                io.Conditioning.Input("positive"),
+                io.Conditioning.Input("negative"),
+                io.Latent.Input("latent_image"),
+                io.Float.Input("denoise", default=1.0, min=0.0, max=1.0, step=0.01),
+            ],
+            outputs=[io.Latent.Output()],
+        )
+
+    @classmethod
+    def execute(cls, model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, denoise) -> io.NodeOutput:
+        nara = _has_nara(model)
+        m = model
+        if nara:
+            m = model.clone()
+
+            def sigma_wrapper(executor, x, timestep, model_options={}, seed=None):
+                set_sigma(float(timestep))
+                return executor(x, timestep, model_options, seed)
+
+            m.add_wrapper_with_key(WrappersMP.PREDICT_NOISE, "moss_nara_sigma", sigma_wrapper)
+        try:
+            out = nodes.common_ksampler(
+                m, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image,
+                denoise=denoise,
+            )[0]
+        finally:
+            if nara:
+                set_sigma(None)
+        return io.NodeOutput(out)
+
+
 def _baked_dora_scale(model, weight_key, offset, dw, dora):
     """The DoRA magnitude in ComfyUI's normalization: output-axis DoRA divides by
     ||W|| where the trainer divides by ||W + dW||, so fold that ratio in; the input
@@ -293,4 +339,4 @@ class MossNaraBake(io.ComfyNode):
 
 class MossNaraExtension(ComfyExtension):
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [MossNaraLoader, MossNaraKSamplerAdvanced, MossNaraBake]
+        return [MossNaraLoader, MossNaraKSampler, MossNaraKSamplerAdvanced, MossNaraBake]
