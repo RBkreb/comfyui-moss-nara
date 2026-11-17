@@ -16,6 +16,7 @@ from safetensors import safe_open
 from torch import nn
 
 import comfy.model_management
+import comfy.model_prefetch
 import comfy.ops
 from comfy.weight_adapter.base import WeightAdapterBase
 
@@ -326,9 +327,12 @@ class NaraAdapter(WeightAdapterBase):
         return out
 
     def bypass_forward(self, org_forward, x, *args, **kwargs):
+        # the base forward stays in the model's malloc graph; the adapter's own
+        # allocations pause it, as kitchen ops do, or every step re-records/breaks
         if not self.has_dora:
             base_out = org_forward(x, *args, **kwargs)
-            return base_out + self.h(x, base_out)
+            with comfy.model_prefetch.pause_malloc_graph():
+                return base_out + self.h(x, base_out)
         if _sigma is None:
             raise RuntimeError("NaRA: no sampling sigma set; sample with the NaRA KSampler")
         core = _core(self.hyper, _sigma)
@@ -342,13 +346,14 @@ class NaraAdapter(WeightAdapterBase):
             if self.wd_on_out:
                 return self._dora_out(org_forward, x, module, core, m, args, kwargs)
             return self._dora_in(org_forward, x, module, core, m, args, kwargs)
-        w, bias, stream = comfy.ops.cast_bias_weight(module, input=x, dtype=torch.float32, offloadable=True)
-        try:
-            if self.wd_on_out:
-                return self._dora_out_dense(org_forward, x, w, bias, core, m, args, kwargs)
-            return self._dora_in_dense(org_forward, x, w, core, m, args, kwargs)
-        finally:
-            comfy.ops.uncast_bias_weight(module, w, bias, stream)
+        with comfy.model_prefetch.pause_malloc_graph():
+            w, bias, stream = comfy.ops.cast_bias_weight(module, input=x, dtype=torch.float32, offloadable=True)
+            try:
+                if self.wd_on_out:
+                    return self._dora_out_dense(org_forward, x, w, bias, core, m, args, kwargs)
+                return self._dora_in_dense(org_forward, x, w, core, m, args, kwargs)
+            finally:
+                comfy.ops.uncast_bias_weight(module, w, bias, stream)
 
     def _statics(self, module, device):
         """The frozen base terms of the Gram expansion, fp32, grouped by slice shape
@@ -415,45 +420,47 @@ class NaraAdapter(WeightAdapterBase):
         into a row scale on y and on the up factor (the output is rounded to that
         dtype anyway)."""
         y = org_forward(x, *args, **kwargs)
-        ratios = self._norms(module, x.device, core)
-        out = None
-        for (offset, alpha, idx, _), r in zip(self.parts, ratios):
-            ts = self._tensors(idx)
-            scale = self._scale(alpha, ts)
-            a = (1 + m * (r - 1)).to(y.dtype)
-            b = (m * r).to(y.dtype)
-            up = ts["lora_up.weight"] * b.to(ts["lora_up.weight"].dtype).reshape(-1, 1)
-            dy = self._delta(x, {**ts, "lora_up.weight": up}, core, scale)
-            ys = y if offset is None else y.narrow(-1, offset[1], offset[2])
-            part = ys * a + dy
-            if module.bias is not None:
-                bs = module.bias if offset is None else module.bias.narrow(0, offset[1], offset[2])
-                part = part - (m * (r - 1)).to(y.dtype) * bs.to(y.dtype)
-            if offset is None:
-                out = part if out is None else out + part
-            else:
-                if out is None:
-                    out = torch.zeros_like(y)
-                out.narrow(-1, offset[1], offset[2]).add_(part)
-        return out
+        with comfy.model_prefetch.pause_malloc_graph():
+            ratios = self._norms(module, x.device, core)
+            out = None
+            for (offset, alpha, idx, _), r in zip(self.parts, ratios):
+                ts = self._tensors(idx)
+                scale = self._scale(alpha, ts)
+                a = (1 + m * (r - 1)).to(y.dtype)
+                b = (m * r).to(y.dtype)
+                up = ts["lora_up.weight"] * b.to(ts["lora_up.weight"].dtype).reshape(-1, 1)
+                dy = self._delta(x, {**ts, "lora_up.weight": up}, core, scale)
+                ys = y if offset is None else y.narrow(-1, offset[1], offset[2])
+                part = ys * a + dy
+                if module.bias is not None:
+                    bs = module.bias if offset is None else module.bias.narrow(0, offset[1], offset[2])
+                    part = part - (m * (r - 1)).to(y.dtype) * bs.to(y.dtype)
+                if offset is None:
+                    out = part if out is None else out + part
+                else:
+                    if out is None:
+                        out = torch.zeros_like(y)
+                    out.narrow(-1, offset[1], offset[2]).add_(part)
+            return out
 
     def _dora_in(self, org_forward, x, module, core, m, args, kwargs):
         """W'x = (W + dW)(c x), c = mag / ||W + dW(sigma)|| per input column; one
         scaled-input base forward per slice (fused qkv slices scale differently)."""
         y = org_forward(x, *args, **kwargs)
-        out = y.float()
-        for (offset, alpha, idx, _), c in zip(self.parts, self._norms(module, x.device, core)):
-            ts = self._tensors(idx)
-            scale = self._scale(alpha, ts)
-            xc = (x.float() * c).to(x.dtype)
-            yc = org_forward(xc, *args, **kwargs)
-            dy = self._delta(xc, ts, core, scale)
-            if offset is None:
-                out = out + m * (yc.float() + dy.float() - y.float())
-            else:
-                sl = slice(offset[1], offset[1] + offset[2])
-                out[..., sl] += m * (yc[..., sl].float() + dy.float() - y[..., sl].float())
-        return out.to(y.dtype)
+        with comfy.model_prefetch.pause_malloc_graph():
+            out = y.float()
+            for (offset, alpha, idx, _), c in zip(self.parts, self._norms(module, x.device, core)):
+                ts = self._tensors(idx)
+                scale = self._scale(alpha, ts)
+                xc = (x.float() * c).to(x.dtype)
+                yc = org_forward(xc, *args, **kwargs)
+                dy = self._delta(xc, ts, core, scale)
+                if offset is None:
+                    out = out + m * (yc.float() + dy.float() - y.float())
+                else:
+                    sl = slice(offset[1], offset[1] + offset[2])
+                    out[..., sl] += m * (yc[..., sl].float() + dy.float() - y[..., sl].float())
+            return out.to(y.dtype)
 
     def _dora_out_dense(self, org_forward, x, w, bias, core, m, args, kwargs):
         """LoHa / LoKr output axis: dense dW, one fp32 base read per forward."""
