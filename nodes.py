@@ -19,6 +19,7 @@ from comfy.weight_adapter.bypass import BypassInjectionManager
 from .nara import (
     NaraAdapter,
     bake_tensors,
+    carries_sora,
     group_nara_layers,
     hyper_from,
     normalize_ema,
@@ -86,7 +87,11 @@ def _map_nara_layers(model, layers):
 
 def _load_nara(model, tensors, meta, strength_model):
     hyper_tensors, rest = split_hyper(tensors)
-    hyper = hyper_from(hyper_tensors, meta)
+    # A file with SORA but no nara_hyper.* is a plain adapter plus Pre-Diag / Post-Ortho
+    # (the trainer's NARA=False run). Those read the base output and the rank factors,
+    # not C(sigma), so it still needs this dynamic path: ComfyUI's native patches have no
+    # slot for sora_diag / sora_C and would drop them with a warning per layer.
+    hyper = hyper_from(hyper_tensors, meta) if hyper_tensors else None
     layers = group_nara_layers(rest)
     groups, loaded_keys, variant = _map_nara_layers(model, layers)
     if not groups:
@@ -96,7 +101,8 @@ def _load_nara(model, tensors, meta, strength_model):
     )
     sora_conds = sum(1 for parts in groups.values() for *_, s in parts if s)
     logging.info(
-        "[moss-nara] loaded NaRA-%s%s%s (%d weights, dynamic core)",
+        "[moss-nara] loaded %s-%s%s%s (%d weights, dynamic core)",
+        "NaRA" if hyper is not None else "SORA",
         variant,
         "+DoRA" if has_dora else "",
         "+SORA" if sora_conds else "",
@@ -112,12 +118,14 @@ def _load_nara(model, tensors, meta, strength_model):
 
     def inject(patcher):
         inner.inject(patcher)
-        hyper.to(comfy.model_management.get_torch_device())
+        if hyper is not None:
+            hyper.to(comfy.model_management.get_torch_device())
 
     def eject(patcher):
         inner.eject(patcher)
-        hyper.to("cpu")
-        hyper._core_cache = None
+        if hyper is not None:
+            hyper.to("cpu")
+            hyper._core_cache = None
 
     m = model.clone()
     m.set_injections(f"{INJECTION_PREFIX}{uuid.uuid4().hex[:8]}", [PatcherInjection(inject, eject)])
@@ -161,7 +169,7 @@ class MossNaraLoader(io.ComfyNode):
         tensors, meta = read_adapter(path)
         tensors, meta = normalize_ema(tensors, meta, path)
         hyper_tensors, _ = split_hyper(tensors)
-        if hyper_tensors:
+        if hyper_tensors or carries_sora(tensors):
             return io.NodeOutput(_load_nara(model, tensors, meta, strength_model))
         return io.NodeOutput(_load_static(model, tensors, strength_model))
 

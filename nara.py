@@ -229,16 +229,19 @@ class SoraConditioning:
     def any(self) -> bool:
         return self.post or self.pre
 
-    def _factors(self):
-        """(C, D, s_p) fp32: s_p = min(1, s_p0 / (||C|| + ||D||)), the trainer's bound."""
-        c = self.C.float()
-        d = self.D.float()
+    def _factors(self, device=None):
+        """(C, D, s_p) fp32: s_p = min(1, s_p0 / (||C|| + ||D||)), the trainer's bound.
+        The SORA tensors are read from the file on CPU and are NOT part of the adapter's
+        `weights` tuple, so BypassForwardHook never moves them: place them on the
+        activation's device at use time (a no-op once there)."""
+        c = self.C.float().to(device)
+        d = self.D.float().to(device)
         s_p = min(1.0, self.s_p0 / (float(c.norm()) + float(d.norm()) + 1e-6))
         return c, d, s_p
 
     def rotate_out(self, y):
         """(R - I) y for activation rows y (..., out), fp32."""
-        c, d, s_p = self._factors()
+        c, d, s_p = self._factors(y.device)
         yf = y.float()
         return s_p * ((yf @ c) @ d.T - (yf @ d) @ c.T)
 
@@ -252,7 +255,8 @@ class SoraConditioning:
         delta is NOT scaled with it."""
         out = total
         if self.pre:
-            d_m = 1.0 + m * (self.diag.float() - 1.0)
+            diag = self.diag.float().to(out.device)
+            d_m = 1.0 + m * (diag - 1.0)
             out = (d_m.to(out.dtype) * base_out + (out - base_out).float()).to(
                 out.dtype
             )
@@ -302,6 +306,13 @@ def _core(hyper, sigma):
     return cache[1]
 
 
+def carries_sora(tensors) -> bool:
+    """The file holds SORA tensors. Such a file needs the dynamic path even without a
+    hypernetwork: ComfyUI's native patches have no slot for `sora_diag` / `sora_C`, so
+    a static load drops them (and warns once per layer)."""
+    return any(k.rsplit(".", 1)[-1] in SORA_NAMES for k in tensors)
+
+
 class NaraAdapter(WeightAdapterBase):
     """NaRA over one weight: `parts` are (offset, alpha, {name: tensor}, dora_scale)
     per adapted slice (a fused qkv weight carries three). `weights` holds every
@@ -315,12 +326,15 @@ class NaraAdapter(WeightAdapterBase):
 
     def __init__(self, loaded_keys, parts, hyper, variant, export_sigma=0.5):
         self.loaded_keys = loaded_keys
+        # None for a file with no nara_hyper.* (a plain adapter carrying SORA): Pre-Diag
+        # and Post-Ortho read the base output and the rank factors, never C(sigma), so
+        # the core is the identity. A NaRA file always passes its hypernetwork.
         self.hyper = hyper
         self.variant = variant
         self.export_sigma = float(export_sigma)
         self.weights = tuple(
             t
-            for _, _, ts, ds in parts
+            for _, _, ts, ds, _ in parts
             for t in list(ts.values()) + ([ds] if ds is not None else [])
         )
         self.parts = []
@@ -352,7 +366,7 @@ class NaraAdapter(WeightAdapterBase):
 
     @staticmethod
     def _out_features(part):
-        offset, _, ts, _ = part
+        offset, _, ts, *_ = part
         if offset is not None:
             return offset[2]
         if "lora_up.weight" in ts:
@@ -364,7 +378,7 @@ class NaraAdapter(WeightAdapterBase):
 
     @staticmethod
     def _in_features(part):
-        _, _, ts, _ = part
+        _, _, ts, *_ = part
         if "lora_down.weight" in ts:
             return ts["lora_down.weight"].shape[1]
         if "hada_w1_b" in ts:
@@ -378,9 +392,20 @@ class NaraAdapter(WeightAdapterBase):
     def _scale(self, alpha, ts):
         return 1.0 if alpha is None else alpha / rank_of(self.variant, ts)
 
+    def _core_at(self, rank, device=None):
+        """The current C(sigma) for this adapter: I(rank) when it has no hypernetwork,
+        which is exactly what a file without `nara_hyper.*` means (no noise axis).
+        The identity is built on `device` (a hypernetwork's core comes from its own
+        parameters, already on the compute device)."""
+        if self.hyper is None:
+            return torch.eye(rank, dtype=torch.float32, device=device)
+        if _sigma is None:
+            raise RuntimeError("NaRA: no sampling sigma set; sample with the NaRA KSampler")
+        return _core(self.hyper, _sigma)
+
     def _delta(self, x, ts, core, scale):
         """The slice's bypass delta in x's dtype (LoRA keeps the factorized chain)."""
-        core_x = core.to(x.dtype)
+        core_x = core.to(device=x.device, dtype=x.dtype)
         if self.variant == "lora":
             up = ts["lora_up.weight"].to(x.dtype)
             down = ts["lora_down.weight"].to(x.dtype)
@@ -390,13 +415,11 @@ class NaraAdapter(WeightAdapterBase):
         return F.linear(x, dw)
 
     def h(self, x, base_out):
-        if _sigma is None:
-            raise RuntimeError("NaRA: no sampling sigma set; sample with the NaRA KSampler")
-        core = _core(self.hyper, _sigma)
         m = getattr(self, "multiplier", 1.0)
         out = None
         for offset, alpha, idx, _ in self.parts:
             ts = self._tensors(idx)
+            core = self._core_at(rank_of(self.variant, ts), x.device)
             delta = self._delta(x, ts, core, self._scale(alpha, ts) * m)
             if offset is None:
                 out = delta if out is None else out + delta
@@ -452,9 +475,9 @@ class NaraAdapter(WeightAdapterBase):
             base_out = org_forward(x, *args, **kwargs)
             with comfy.model_prefetch.pause_malloc_graph():
                 return base_out + self.h(x, base_out)
-        if _sigma is None:
-            raise RuntimeError("NaRA: no sampling sigma set; sample with the NaRA KSampler")
-        core = _core(self.hyper, _sigma)
+        core = self._core_at(
+            rank_of(self.variant, self._tensors(self.parts[0][2])), x.device
+        )
         m = getattr(self, "multiplier", 1.0)
         # org_forward may be another bypass hook when adapters stack; the DoRA
         # norm reads the raw module's weight (earlier deltas are not folded in)
