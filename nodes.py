@@ -27,6 +27,7 @@ from .nara import (
     read_adapter,
     set_sigma,
     split_hyper,
+    split_sora,
     variant_of,
 )
 
@@ -76,8 +77,10 @@ def _map_nara_layers(model, layers):
         alpha = parts.get("alpha")
         alpha = float(alpha.item()) if alpha is not None else None
         dora = parts.get("dora_scale")
-        factors = {k: v for k, v in parts.items() if k not in ("alpha", "dora_scale")}
-        groups.setdefault(weight_key, []).append((offset, alpha, factors, dora))
+        sora, factors = split_sora(parts)
+        groups.setdefault(weight_key, []).append(
+            (offset, alpha, factors, dora, sora or None)
+        )
     return groups, loaded_keys, variant
 
 
@@ -88,8 +91,17 @@ def _load_nara(model, tensors, meta, strength_model):
     groups, loaded_keys, variant = _map_nara_layers(model, layers)
     if not groups:
         raise ValueError("no NaRA layer matched this model")
-    has_dora = any(ds is not None for parts in groups.values() for _, _, _, ds in parts)
-    logging.info("[moss-nara] loaded NaRA-%s%s (%d weights, dynamic core)", variant, "+DoRA" if has_dora else "", len(groups))
+    has_dora = any(
+        ds is not None for parts in groups.values() for _, _, _, ds, _ in parts
+    )
+    sora_conds = sum(1 for parts in groups.values() for *_, s in parts if s)
+    logging.info(
+        "[moss-nara] loaded NaRA-%s%s%s (%d weights, dynamic core)",
+        variant,
+        "+DoRA" if has_dora else "",
+        "+SORA" if sora_conds else "",
+        len(groups),
+    )
 
     manager = BypassInjectionManager()
     for weight_key, parts in groups.items():
@@ -316,14 +328,22 @@ class MossNaraBake(io.ComfyNode):
             if target is None:
                 logging.warning("[moss-nara] key not found in model: %s", stem)
                 continue
-            variant = variant_of(parts)
-            out = bake_tensors(variant, parts, core)
-            dora = parts.get("dora_scale")
+            sora, factors = split_sora(parts)
+            if sora:
+                # A SORA layer's rotation touches the base weight, which a static
+                # load_lora patch set cannot express: bake it through the dynamic
+                # loader (sample as usual) or export the trainer's 'comfy' format.
+                logging.warning(
+                    "[moss-nara] %s carries SORA; baking at a fixed sigma drops it", stem
+                )
+            variant = variant_of(factors)
+            out = bake_tensors(variant, factors, core)
+            dora = factors.get("dora_scale")
             if dora is not None:
                 weight_key, offset = target if isinstance(target, tuple) else (target, None)
-                alpha = float(parts["alpha"].item()) if "alpha" in parts else None
-                scale = 1.0 if alpha is None else alpha / rank_of(variant, parts)
-                dw = part_delta(variant, parts, core, scale, torch.float32)
+                alpha = float(factors["alpha"].item()) if "alpha" in factors else None
+                scale = 1.0 if alpha is None else alpha / rank_of(variant, factors)
+                dw = part_delta(variant, factors, core, scale, torch.float32)
                 out["dora_scale"] = _baked_dora_scale(model, weight_key, offset, dw, dora)
             for name, value in out.items():
                 baked[f"{stem}.{name}"] = value

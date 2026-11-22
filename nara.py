@@ -28,7 +28,10 @@ LORA_NAMES = ("lora_up.weight", "lora_down.weight")
 LOHA_NAMES = ("hada_w1_a", "hada_w1_b", "hada_w2_a", "hada_w2_b")
 LOKR_NAMES = ("lokr_w1", "lokr_w1_a", "lokr_w1_b", "lokr_w2", "lokr_w2_a", "lokr_w2_b")
 COMMON_NAMES = ("alpha", "dora_scale")
-NARA_NAMES = LORA_NAMES + LOHA_NAMES + LOKR_NAMES + COMMON_NAMES
+# SORA (arXiv:2511.00051) conditioning of any additive kind: a bounded skew rotation of
+# the layer's whole output and / or a learned per-channel scale of the base output.
+SORA_NAMES = ("sora_C", "sora_D", "sora_diag", "sora_s_p0")
+NARA_NAMES = LORA_NAMES + LOHA_NAMES + LOKR_NAMES + COMMON_NAMES + SORA_NAMES
 
 
 class NaraHyper(nn.Module):
@@ -189,6 +192,75 @@ def part_delta(variant, parts, core, scale, dtype):
     return torch.kron(w1, w2) * scale
 
 
+def split_sora(parts):
+    """(the SORA tensors of one layer, the remaining per-layer set)."""
+    sora = {k: parts[k] for k in SORA_NAMES if k in parts}
+    return sora, {k: v for k, v in parts.items() if k not in SORA_NAMES}
+
+
+class SoraConditioning:
+    """SORA's two switches on one weight, ported from the trainer's `adapters/sora.py`.
+
+    Post-Ortho: y -> y + m (R - I) y with R = I + s_p (D C^T - C D^T), a bounded skew
+    rotation of the whole layer output (base + delta). Pre-Diag: the base output's
+    per-channel scale d replaces DoRA, y -> d_m fn(x) + (1 - d_m) delta_m(x) with
+    d_m = 1 + m (d - 1).
+
+    Both read the layer's output and its own bypass delta, never a dense weight, so
+    they stack on quantized bases. All math fp32; the rank term is never materialised
+    as an out x out matrix."""
+
+    def __init__(self, sora: dict):
+        self.C = sora.get("sora_C")
+        self.D = sora.get("sora_D")
+        s_p0 = sora.get("sora_s_p0")
+        self.s_p0 = 1.0 if s_p0 is None else float(s_p0.reshape(()))
+        self.diag = sora.get("sora_diag")
+
+    @property
+    def post(self) -> bool:
+        return self.C is not None
+
+    @property
+    def pre(self) -> bool:
+        return self.diag is not None
+
+    @property
+    def any(self) -> bool:
+        return self.post or self.pre
+
+    def _factors(self):
+        """(C, D, s_p) fp32: s_p = min(1, s_p0 / (||C|| + ||D||)), the trainer's bound."""
+        c = self.C.float()
+        d = self.D.float()
+        s_p = min(1.0, self.s_p0 / (float(c.norm()) + float(d.norm()) + 1e-6))
+        return c, d, s_p
+
+    def rotate_out(self, y):
+        """(R - I) y for activation rows y (..., out), fp32."""
+        c, d, s_p = self._factors()
+        yf = y.float()
+        return s_p * ((yf @ c) @ d.T - (yf @ d) @ c.T)
+
+    def apply(self, total, base_out, m: float):
+        """The conditioning on one slice's output at strength m. `total` is
+        base + delta, `base_out` the base alone (the same columns).
+
+        Post-Ortho: rotate the whole output, `total + m (R - I) total`. Pre-Diag: the
+        trainer's `d_m fn(x) + (1 - d_m) delta(x)` collapses to `d_m base + delta` —
+        the base output scaled per channel, the delta left at full strength — so the
+        delta is NOT scaled with it."""
+        out = total
+        if self.pre:
+            d_m = 1.0 + m * (self.diag.float() - 1.0)
+            out = (d_m.to(out.dtype) * base_out + (out - base_out).float()).to(
+                out.dtype
+            )
+        if self.post:
+            out = (out.float() + m * self.rotate_out(out)).to(out.dtype)
+        return out
+
+
 def bake_tensors(variant, parts, core):
     """The fixed-sigma plain-adapter tensors: the core folded into the up factors
     (the trainer's comfy export rule), alpha and dora_scale carried over."""
@@ -246,16 +318,24 @@ class NaraAdapter(WeightAdapterBase):
         self.hyper = hyper
         self.variant = variant
         self.export_sigma = float(export_sigma)
-        self.weights = tuple(t for _, _, ts, ds in parts for t in list(ts.values()) + ([ds] if ds is not None else []))
+        self.weights = tuple(
+            t
+            for _, _, ts, ds in parts
+            for t in list(ts.values()) + ([ds] if ds is not None else [])
+        )
         self.parts = []
+        self.sora = []
         i = 0
-        for offset, alpha, ts, ds in parts:
+        for offset, alpha, ts, ds, sora in parts:
             idx = {name: i + j for j, name in enumerate(ts)}
             i += len(ts)
             dora_idx = None if ds is None else i
             if ds is not None:
                 i += 1
             self.parts.append((offset, alpha, idx, dora_idx))
+            # SORA conditioning per slice, parallel to `parts`. It never enters
+            # `weights`: the rotation reads factors, not the flat tensor list.
+            self.sora.append(SoraConditioning(sora or {}))
         self.has_dora = any(d is not None for _, _, _, d in self.parts)
         self.wd_on_out = True
         if self.has_dora:
@@ -327,6 +407,45 @@ class NaraAdapter(WeightAdapterBase):
         return out
 
     def bypass_forward(self, org_forward, x, *args, **kwargs):
+        m = getattr(self, "multiplier", 1.0)
+        plain = self._forward_plain(org_forward, x, *args, **kwargs)
+        conds = [c for c in self.sora if c.any]
+        if not conds:
+            return plain
+        # Pre-Diag scales the base output and leaves the delta at full strength, so it
+        # needs the base apart from the delta. `_forward_plain` already ran the base
+        # forward once; the base is `plain` minus this adapter's own delta, never a
+        # second `org_forward` call (which would re-run any earlier adapter in a stack).
+        base = self._base_of(org_forward, x, plain, args, kwargs) if any(
+            c.pre for c in conds
+        ) else None
+        if len(conds) == 1 and self.parts[0][0] is None:
+            return self.sora[0].apply(plain, plain if base is None else base, m)
+        result = plain.float()
+        for (offset, _, _, _), cond in zip(self.parts, self.sora):
+            if not cond.any:
+                continue
+            sl = None if offset is None else slice(offset[1], offset[1] + offset[2])
+            total = result if sl is None else result[..., sl]
+            b = total if base is None else (base if sl is None else base[..., sl])
+            cond_out = cond.apply(total, b, m)
+            if sl is None:
+                result = cond_out.float()
+            else:
+                result[..., sl] = cond_out.float()
+        return result.to(plain.dtype)
+
+    def _base_of(self, org_forward, x, plain, args, kwargs):
+        """The layer's output with this adapter's delta removed, from the forward
+        already computed. The DoRA paths return a value that already folds the delta
+        in, so subtracting `h(x, ·)` inverts them the same way."""
+        if not self.has_dora:
+            return plain - self.h(x, plain)
+        # A DoRA path's output is not base + delta, so fall back to the raw module
+        # forward: it holds no adapter of this one, only an earlier stack member.
+        return org_forward(x, *args, **kwargs)
+
+    def _forward_plain(self, org_forward, x, *args, **kwargs):
         # the base forward stays in the model's malloc graph; the adapter's own
         # allocations pause it, as kitchen ops do, or every step re-records/breaks
         if not self.has_dora:
