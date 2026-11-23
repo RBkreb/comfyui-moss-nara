@@ -12,7 +12,7 @@ readme = "README.md"
 Repository = "https://github.com/RBkreb/comfyui-moss-nara"
 
 [tool.comfy]
-PublisherId = "rbkreb"
+PublisherId = "rbkrebs"
 DisplayName = "MOSS-Image NaRA"
 # Needs comfy.model_base.MOSSImage, added in v0.42.0.
 requires-comfyui = ">=0.42.0"
