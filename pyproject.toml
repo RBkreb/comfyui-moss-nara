@@ -8,6 +8,9 @@ requires-python = ">=3.10"
 dependencies = []
 readme = "README.md"
 
+[project.urls]
+Repository = "https://github.com/RBkreb/comfyui-moss-nara"
+
 [tool.comfy]
 PublisherId = "rbkrebs"
 DisplayName = "MOSS-Image NaRA"
