@@ -249,6 +249,8 @@ class SoraConditioning:
         s_p0 = sora.get("sora_s_p0")
         self.s_p0 = 1.0 if s_p0 is None else float(s_p0.reshape(()))
         self.diag = sora.get("sora_diag")
+        self._factors_cache = None
+        self._diag_cache = None
 
     @property
     def post(self) -> bool:
@@ -266,11 +268,16 @@ class SoraConditioning:
         """(C, D, s_p) fp32: s_p = min(1, s_p0 / (||C|| + ||D||)), the trainer's bound.
         The SORA tensors are read from the file on CPU and are NOT part of the adapter's
         `weights` tuple, so BypassForwardHook never moves them: place them on the
-        activation's device at use time (a no-op once there)."""
+        activation's device once and cache, they are constant across forwards."""
+        cache = self._factors_cache
+        if cache is not None and cache[0] == device:
+            return cache[1]
         c = self.C.float().to(device)
         d = self.D.float().to(device)
         s_p = min(1.0, self.s_p0 / (float(c.norm()) + float(d.norm()) + 1e-6))
-        return c, d, s_p
+        factors = (c, d, s_p)
+        self._factors_cache = (device, factors)
+        return factors
 
     def rotate_out(self, y):
         """(R - I) y for activation rows y (..., out), fp32."""
@@ -288,8 +295,12 @@ class SoraConditioning:
         delta is NOT scaled with it."""
         out = total
         if self.pre:
-            diag = self.diag.float().to(out.device)
-            d_m = 1.0 + m * (diag - 1.0)
+            cache = self._diag_cache
+            if cache is None or cache[0] != (out.device, m):
+                diag = self.diag.float().to(out.device)
+                cache = ((out.device, m), 1.0 + m * (diag - 1.0))
+                self._diag_cache = cache
+            d_m = cache[1]
             out = (d_m.to(out.dtype) * base_out + (out - base_out).float()).to(
                 out.dtype
             )
@@ -352,8 +363,9 @@ class NaraAdapter(WeightAdapterBase):
     tensor flat so BypassForwardHook moves them to the compute device; parts index
     into it. DoRA normalizes after the live core in fp32 through the Gram expansion
     of ||W + dW(sigma)||; the static base terms (||W||^2, W down^T / W^T up and the
-    factor Gram) are cached per adapter at first use, so a step only runs r x r
-    matmuls. LoHa / LoKr keep the dense per-forward norm."""
+    factor Gram) are cached per adapter at first use and the ratios per (device,
+    core), so cond and uncond share one r x r norm pass per step. LoHa / LoKr keep
+    the dense per-forward norm."""
 
     name = "nara"
 
@@ -396,6 +408,8 @@ class NaraAdapter(WeightAdapterBase):
             else:
                 raise ValueError(f"dora_scale shape {tuple(ds.shape)} matches neither axis ({out_features}, {in_features})")
         self._norm_cache = None
+        self._norms_cache = None
+        self._eye_cache = None
 
     @staticmethod
     def _out_features(part):
@@ -428,22 +442,29 @@ class NaraAdapter(WeightAdapterBase):
     def _core_at(self, rank, device=None):
         """The current C(sigma) for this adapter: I(rank) when it has no hypernetwork,
         which is exactly what a file without `nara_hyper.*` means (no noise axis).
-        The identity is built on `device` (a hypernetwork's core comes from its own
-        parameters, already on the compute device)."""
+        The identity is cached per (rank, device); a hypernetwork's core comes from
+        its own parameters, already on the compute device."""
         if self.hyper is None:
-            return torch.eye(rank, dtype=torch.float32, device=device)
+            cache = self._eye_cache
+            if cache is None or cache[0] != (rank, device):
+                cache = ((rank, device), torch.eye(rank, dtype=torch.float32, device=device))
+                self._eye_cache = cache
+            return cache[1]
         if _sigma is None:
             raise RuntimeError("NaRA: no sampling sigma set; sample with the NaRA KSampler")
         return _core(self.hyper, _sigma)
 
     def _delta(self, x, ts, core, scale):
         """The slice's bypass delta in x's dtype (LoRA keeps the factorized chain)."""
-        core_x = core.to(device=x.device, dtype=x.dtype)
         if self.variant == "lora":
             up = ts["lora_up.weight"].to(x.dtype)
             down = ts["lora_down.weight"].to(x.dtype)
-            hidden = F.linear(x, down) @ core_x
+            hidden = F.linear(x, down)
+            # no hypernetwork means the core is the exact identity: skip the matmul
+            if self.hyper is not None:
+                hidden = hidden @ core.to(device=x.device, dtype=x.dtype)
             return F.linear(hidden, up) * scale
+        core_x = core.to(device=x.device, dtype=x.dtype)
         dw = part_delta(self.variant, ts, core_x, scale, x.dtype)
         return F.linear(x, dw)
 
@@ -464,17 +485,26 @@ class NaraAdapter(WeightAdapterBase):
 
     def bypass_forward(self, org_forward, x, *args, **kwargs):
         m = getattr(self, "multiplier", 1.0)
-        plain = self._forward_plain(org_forward, x, *args, **kwargs)
         conds = [c for c in self.sora if c.any]
+        need_base = any(c.pre for c in conds)
+        if self.has_dora:
+            plain = self._forward_plain(org_forward, x, *args, **kwargs)
+            # A DoRA path's output is not base + delta, so fall back to the raw
+            # module forward: it holds no adapter of this one, only an earlier
+            # stack member.
+            base = org_forward(x, *args, **kwargs) if need_base else None
+        else:
+            base_out = org_forward(x, *args, **kwargs)
+            # the adapter's own allocations pause the model's malloc graph, as
+            # kitchen ops do, or every step re-records/breaks
+            with comfy.model_prefetch.pause_malloc_graph():
+                delta = self.h(x, base_out)
+                plain = base_out + delta
+                # Pre-Diag scales the base output and leaves the delta at full
+                # strength; reuse the one delta instead of recomputing h.
+                base = plain - delta if need_base else None
         if not conds:
             return plain
-        # Pre-Diag scales the base output and leaves the delta at full strength, so it
-        # needs the base apart from the delta. `_forward_plain` already ran the base
-        # forward once; the base is `plain` minus this adapter's own delta, never a
-        # second `org_forward` call (which would re-run any earlier adapter in a stack).
-        base = self._base_of(org_forward, x, plain, args, kwargs) if any(
-            c.pre for c in conds
-        ) else None
         if len(conds) == 1 and self.parts[0][0] is None:
             return self.sora[0].apply(plain, plain if base is None else base, m)
         result = plain.float()
@@ -491,23 +521,7 @@ class NaraAdapter(WeightAdapterBase):
                 result[..., sl] = cond_out.float()
         return result.to(plain.dtype)
 
-    def _base_of(self, org_forward, x, plain, args, kwargs):
-        """The layer's output with this adapter's delta removed, from the forward
-        already computed. The DoRA paths return a value that already folds the delta
-        in, so subtracting `h(x, ·)` inverts them the same way."""
-        if not self.has_dora:
-            return plain - self.h(x, plain)
-        # A DoRA path's output is not base + delta, so fall back to the raw module
-        # forward: it holds no adapter of this one, only an earlier stack member.
-        return org_forward(x, *args, **kwargs)
-
     def _forward_plain(self, org_forward, x, *args, **kwargs):
-        # the base forward stays in the model's malloc graph; the adapter's own
-        # allocations pause it, as kitchen ops do, or every step re-records/breaks
-        if not self.has_dora:
-            base_out = org_forward(x, *args, **kwargs)
-            with comfy.model_prefetch.pause_malloc_graph():
-                return base_out + self.h(x, base_out)
         core = self._core_at(
             rank_of(self.variant, self._tensors(self.parts[0][2])), x.device
         )
@@ -570,7 +584,11 @@ class NaraAdapter(WeightAdapterBase):
 
     def _norms(self, module, device, core):
         """mag / ||W + dW(sigma)|| per DoRA row, fp32, batched per shape group:
-        ||W + dW||^2 = ||W||^2 + 2<W, dW> + ||dW||^2 with the live core."""
+        ||W + dW||^2 = ||W||^2 + 2<W, dW> + ||dW||^2 with the live core. Cached per
+        (device, core): cond and uncond of a step share one cached core tensor."""
+        cache = self._norms_cache
+        if cache is not None and cache[0] == device and cache[1] is core:
+            return cache[2]
         eps = torch.finfo(torch.float32).eps
         groups, spans = self._statics(module, device)
         flat = []
@@ -587,7 +605,9 @@ class NaraAdapter(WeightAdapterBase):
             norm = (base2 + 2 * cross + delta).clamp_min(0).sqrt() + eps
             flat.append((mag / norm).reshape(-1))
         flat = torch.cat(flat)
-        return [flat[s : s + n] for s, n in spans]
+        ratios = [flat[s : s + n] for s, n in spans]
+        self._norms_cache = (device, core, ratios)
+        return ratios
 
     def _dora_out(self, org_forward, x, module, core, m, args, kwargs):
         """y + m ((r - 1) Wx + r dy), r = mag / ||W + dW(sigma)|| per output row.
