@@ -22,6 +22,7 @@ from .nara import (
     carries_sora,
     group_nara_layers,
     hyper_from,
+    map_nara_layers,
     normalize_ema,
     part_delta,
     rank_of,
@@ -58,31 +59,9 @@ def _export_sigma(meta):
 
 
 def _map_nara_layers(model, layers):
-    """Resolve file layers to weight keys; group slices of one weight (fused qkv)."""
+    """`map_nara_layers` against this model's key map."""
     key_map = comfy.lora.model_lora_keys_unet(model.model, {})
-    groups = {}
-    loaded_keys = set()
-    variant = None
-    for stem, parts in layers.items():
-        target = key_map.get(stem)
-        if target is None:
-            logging.warning("[moss-nara] key not found in model: %s", stem)
-            continue
-        v = variant_of(parts)
-        if variant is None:
-            variant = v
-        elif variant != v:
-            raise ValueError(f"{stem}: mixed NaRA variants ({variant} and {v}) in one file")
-        loaded_keys.update(stem + "." + name for name in parts)
-        weight_key, offset = target if isinstance(target, tuple) else (target, None)
-        alpha = parts.get("alpha")
-        alpha = float(alpha.item()) if alpha is not None else None
-        dora = parts.get("dora_scale")
-        sora, factors = split_sora(parts)
-        groups.setdefault(weight_key, []).append(
-            (offset, alpha, factors, dora, sora or None)
-        )
-    return groups, loaded_keys, variant
+    return map_nara_layers(key_map, layers)
 
 
 def _load_nara(model, tensors, meta, strength_model):

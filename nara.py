@@ -8,6 +8,7 @@ does; DoRA normalizes after the live BA*C(sigma), per forward, in fp32.
 """
 
 import json
+import logging
 import os
 
 import torch
@@ -196,6 +197,38 @@ def split_sora(parts):
     """(the SORA tensors of one layer, the remaining per-layer set)."""
     sora = {k: parts[k] for k in SORA_NAMES if k in parts}
     return sora, {k: v for k, v in parts.items() if k not in SORA_NAMES}
+
+
+def map_nara_layers(key_map, layers):
+    """Resolve file layers to weight keys; group slices of one weight (fused qkv).
+
+    `key_map` is what `comfy.lora.model_lora_keys_unet` returns: stem -> weight key,
+    or a tuple when several slices fuse into one weight. Passing the map in (rather
+    than walking the model) keeps this usable without a ComfyUI runtime.
+    """
+    groups = {}
+    loaded_keys = set()
+    variant = None
+    for stem, parts in layers.items():
+        target = key_map.get(stem)
+        if target is None:
+            logging.warning("[moss-nara] key not found in model: %s", stem)
+            continue
+        v = variant_of(parts)
+        if variant is None:
+            variant = v
+        elif variant != v:
+            raise ValueError(f"{stem}: mixed NaRA variants ({variant} and {v}) in one file")
+        loaded_keys.update(stem + "." + name for name in parts)
+        weight_key, offset = target if isinstance(target, tuple) else (target, None)
+        alpha = parts.get("alpha")
+        alpha = float(alpha.item()) if alpha is not None else None
+        dora = parts.get("dora_scale")
+        sora, factors = split_sora(parts)
+        groups.setdefault(weight_key, []).append(
+            (offset, alpha, factors, dora, sora or None)
+        )
+    return groups, loaded_keys, variant
 
 
 class SoraConditioning:

@@ -2,11 +2,12 @@
 
 No ComfyUI runtime (the model would need a GPU and the whole stack), so this drives the
 same functions MossNara_Loader.execute calls -- normalize_ema, split_hyper, carries_sora,
-group_nara_layers, _map_nara_layers and NaraAdapter construction -- on a synthetic key
+group_nara_layers, map_nara_layers and NaraAdapter construction -- on a synthetic key
 map standing in for comfy.lora.model_lora_keys_unet, then runs one bypass forward and
 checks the emitted Pre-Diag conditioning is the trainer's formula.
 """
 
+import contextlib
 import importlib.util
 import sys
 
@@ -16,7 +17,6 @@ import torch.nn.functional as F
 from safetensors import safe_open
 
 NARA = "D:/comfyui/ComfyUI/custom_nodes/comfyui-moss-nara/nara.py"
-NODES = "D:/comfyui/ComfyUI/custom_nodes/comfyui-moss-nara/nodes.py"
 FILE = "D:/comfyui/ComfyUI/models/loras/moss/lora-prediag-rigid-ema-lycoris-fp32.safetensors"
 D = 3072
 M = 0.7
@@ -34,9 +34,7 @@ def _stub_comfy():
     ):
         stubs[name] = type(sys)(name)
     stubs["comfy.weight_adapter.base"].WeightAdapterBase = type("Base", (), {})
-    stubs["comfy.model_prefetch"].pause_malloc_graph = lambda: __import__(
-        "contextlib"
-    ).nullcontext()
+    stubs["comfy.model_prefetch"].pause_malloc_graph = contextlib.nullcontext
     stubs["comfy.model_management"].get_torch_device = lambda: torch.device("cpu")
     for name in ("model_prefetch", "model_management", "ops", "weight_adapter"):
         setattr(stubs["comfy"], name, stubs[f"comfy.{name}"])
@@ -61,45 +59,13 @@ def load_plugin():
     return mod
 
 
-def load_nodes_map(plugin):
-    """`_map_nara_layers` lives in nodes.py (needs the whole ComfyUI node API), so lift
-    just that function's source and exec it against the plugin's globals plus a stub
-    comfy.lora that resolves the same way `model_lora_keys_unet` does for a linear."""
-    import ast
-
-    src = open(NODES, encoding="utf-8").read()
-    tree = ast.parse(src)
-    fn = next(
-        n
-        for n in tree.body
-        if isinstance(n, ast.FunctionDef) and n.name == "_map_nara_layers"
-    )
-    code = ast.get_source_segment(src, fn)
-
-    fake_lora = type(sys)("comfy.lora")
-
-    def model_lora_keys_unet(model, key_map=None):
-        key_map = {} if key_map is None else key_map
-        for i in range(len(model.layers)):
-            for n in ("q", "k", "v", "o", "ffn_down", "ffn_up_gate"):
-                key_map[f"lora_unet_layers_{i}_proj_{n}"] = f"layers.{i}.proj.{n}.weight"
-        return key_map
-
-    fake_lora.model_lora_keys_unet = model_lora_keys_unet
-    # the plugin loader popped its stubs, so re-install them for this call
-    stubs = _stub_comfy()
-    stubs["comfy"].lora = fake_lora
-    stubs["comfy.lora"] = fake_lora
-    comfy = stubs["comfy"]
-    logging_stub = type(sys)("logging")
-    ns = {
-        **{k: getattr(plugin, k) for k in dir(plugin)},
-        "torch": torch,
-        "logging": __import__("logging"),
+def key_map_for(model):
+    """Stand-in for comfy.lora.model_lora_keys_unet: same shape it returns for linear."""
+    return {
+        f"lora_unet_layers_{i}_proj_{n}": f"layers.{i}.proj.{n}.weight"
+        for i in range(len(model.layers))
+        for n in ("q", "k", "v", "o", "ffn_down", "ffn_up_gate")
     }
-    ns["comfy"] = comfy  # after the plugin's own names: `dir(plugin)` also has `comfy`
-    exec(compile(code, NODES, "exec"), ns)
-    return ns["_map_nara_layers"]
 
 
 class Linear(nn.Module):
@@ -116,8 +82,8 @@ class Linear(nn.Module):
 
 
 class Model(nn.Module):
-    """`MossNara_Loader` sees a comfy ModelPatcher; `_map_nara_layers` reads `model.model`
-    and calls `get_submodule` on it, so a tiny holder is enough."""
+    """`MossNara_Loader` sees a comfy ModelPatcher and reads `model.model`; two blocks
+    with the real projection names are enough for the key map and one bypass forward."""
 
     def __init__(self):
         super().__init__()
@@ -135,9 +101,6 @@ class Patcher:
 
     def __init__(self):
         self.model = Model()
-
-    def get_submodule(self, path):
-        return self.model.get_submodule(path)
 
 
 def main() -> int:
@@ -162,8 +125,7 @@ def main() -> int:
 
     _, rest = plugin.split_hyper(tensors)
     layers = plugin.group_nara_layers(rest)
-    map_layers = load_nodes_map(plugin)
-    groups, loaded, variant = map_layers(model, layers)
+    groups, loaded, variant = plugin.map_nara_layers(key_map_for(model.model), layers)
     print(f"matched {len(groups)} weights of {len(layers)} in the file, variant {variant}")
 
     covered = sum(len(parts) for parts in groups.values())

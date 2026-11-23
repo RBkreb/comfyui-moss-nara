@@ -6,6 +6,7 @@ per-layer conditioning are exercised against the trainer's own numbers.
     python scripts/check_plugin_file.py <lycoris .safetensors>
 """
 
+import contextlib
 import importlib.util
 import sys
 from pathlib import Path
@@ -34,9 +35,7 @@ def load_plugin():
     ):
         stubs[name] = type(sys)(name)
     stubs["comfy.weight_adapter.base"].WeightAdapterBase = type("Base", (), {})
-    stubs["comfy.model_prefetch"].pause_malloc_graph = lambda: __import__(
-        "contextlib"
-    ).nullcontext()
+    stubs["comfy.model_prefetch"].pause_malloc_graph = contextlib.nullcontext
     stubs["comfy.model_management"].get_torch_device = lambda: torch.device("cpu")
     saved = {k: sys.modules.get(k) for k in stubs}
     sys.modules.update(stubs)
@@ -52,6 +51,9 @@ def load_plugin():
 
 
 def main(path: str) -> int:
+    if not Path(path).is_file():
+        print(f"SKIP: {path} does not exist (pass another lycoris export)")
+        return 0
     mod = load_plugin()
     with safe_open(path, framework="pt", device="cpu") as f:
         tensors = {k: f.get_tensor(k) for k in f.keys()}
@@ -104,7 +106,6 @@ def main(path: str) -> int:
     print(f"    flags: post={cond.post} pre={cond.pre}")
 
     # a numeric check on that layer: Pre-Diag at m=1 must be d*base + delta
-    r = torch.randn(3, 8, 64)
     if cond.pre:
         d = cond.diag.float()
         base = torch.randn(3, 8, d.numel())

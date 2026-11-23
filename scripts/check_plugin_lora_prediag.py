@@ -6,6 +6,7 @@ at a per-sample sigma; the plugin is run with hyper=None (C(sigma) = I) through 
 NaraAdapter.bypass_forward the Loader builds.
 """
 
+import contextlib
 import importlib.util
 import sys
 
@@ -41,9 +42,7 @@ def load_plugin():
     ):
         stubs[name] = type(sys)(name)
     stubs["comfy.weight_adapter.base"].WeightAdapterBase = type("Base", (), {})
-    stubs["comfy.model_prefetch"].pause_malloc_graph = lambda: __import__(
-        "contextlib"
-    ).nullcontext()
+    stubs["comfy.model_prefetch"].pause_malloc_graph = contextlib.nullcontext
     stubs["comfy.model_management"].get_torch_device = lambda: torch.device("cpu")
     # a submodule registered in sys.modules is not an attribute of its parent package,
     # and nara.py calls comfy.model_prefetch.pause_malloc_graph by attribute

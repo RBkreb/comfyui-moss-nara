@@ -4,6 +4,7 @@ trainer's fp64 formulas for one linear.
     python scripts/check_plugin_sora.py
 """
 
+import contextlib
 import importlib.util
 import sys
 from pathlib import Path
@@ -31,9 +32,7 @@ def load_plugin():
         pass
 
     stubs["comfy.weight_adapter.base"].WeightAdapterBase = Base
-    stubs["comfy.model_prefetch"].pause_malloc_graph = lambda: __import__(
-        "contextlib"
-    ).nullcontext()
+    stubs["comfy.model_prefetch"].pause_malloc_graph = contextlib.nullcontext
     stubs["comfy.model_management"].get_torch_device = lambda: torch.device("cpu")
     saved = {k: sys.modules.get(k) for k in stubs}
     sys.modules.update(stubs)

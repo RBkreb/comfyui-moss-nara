@@ -5,6 +5,7 @@ the plugin's bypass math on the same weights and compare. This is the check that
 plugin's SORA conditioning is wired the way training defined it.
 """
 
+import contextlib
 import importlib.util
 import sys
 
@@ -39,9 +40,7 @@ def load_plugin():
     ):
         stubs[name] = type(sys)(name)
     stubs["comfy.weight_adapter.base"].WeightAdapterBase = type("Base", (), {})
-    stubs["comfy.model_prefetch"].pause_malloc_graph = lambda: __import__(
-        "contextlib"
-    ).nullcontext()
+    stubs["comfy.model_prefetch"].pause_malloc_graph = contextlib.nullcontext
     stubs["comfy.model_management"].get_torch_device = lambda: torch.device("cpu")
     saved = {k: sys.modules.get(k) for k in stubs}
     sys.modules.update(stubs)
@@ -129,7 +128,7 @@ def main() -> int:
     err = (got - want_mid).abs().max().item()
     scale = want_mid.abs().max().item()
     ok = err / scale < 2e-4
-    print(f"trainer vs plugin, one LoKr-NaRA+SORA layer at sigma=0.5")
+    print("trainer vs plugin, one LoKr-NaRA+SORA layer at sigma=0.5")
     print(f"  max|err| {err:.3e}  (relative {err / scale:.2e})  {'ok' if ok else 'FAIL'}")
     print(f"  (reference at the run's own per-sample sigma differs, as it must: "
           f"{(want - want_mid).abs().max().item():.3e})")

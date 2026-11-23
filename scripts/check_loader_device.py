@@ -5,11 +5,11 @@ them itself. This reproduces the real failure and then checks the fix.
     CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 python scripts/check_loader_device.py
 """
 
+import contextlib
 import importlib.util
 import sys
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from safetensors import safe_open
 
@@ -33,9 +33,7 @@ def load_plugin():
     ):
         stubs[name] = type(sys)(name)
     stubs["comfy.weight_adapter.base"].WeightAdapterBase = type("Base", (), {})
-    stubs["comfy.model_prefetch"].pause_malloc_graph = lambda: __import__(
-        "contextlib"
-    ).nullcontext()
+    stubs["comfy.model_prefetch"].pause_malloc_graph = contextlib.nullcontext
     stubs["comfy.model_management"].get_torch_device = lambda: torch.device("cuda")
     for name in ("model_prefetch", "model_management", "ops", "weight_adapter"):
         setattr(stubs["comfy"], name, stubs[f"comfy.{name}"])
