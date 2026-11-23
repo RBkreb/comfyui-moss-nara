@@ -44,5 +44,5 @@ git clone https://github.com/RBkreb/comfyui-moss-nara.git
 
 ## 示例
 [DoRA+NaRA](https://huggingface.co/RBXLSP/TextureLux-DoRAN)
-
+[Pre-diag](https://huggingface.co/RBXLSP/RigidFrontier-SORA)
 [MossTrainer](https://github.com/RBkreb/KohakuMossTrainer)
