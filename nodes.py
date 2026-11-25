@@ -13,7 +13,7 @@ import comfy.ops
 import comfy.samplers
 import folder_paths
 import nodes
-from comfy.patcher_extension import PatcherInjection, WrappersMP
+from comfy.patcher_extension import WrappersMP
 from comfy.weight_adapter.bypass import BypassInjectionManager
 
 from .nara import (
@@ -34,6 +34,36 @@ from .nara import (
 )
 
 INJECTION_PREFIX = "moss_nara_"
+MODEL_OPTION_FUSED = "moss_nara_fused"
+
+
+class NaraInjection:
+    """The NaRA bypass injection; keeps the adapters so Fast Mode can switch them.
+
+    The adapters are shared with the hooks by reference, and ModelPatcher clones
+    copy the injection list, so a toggle set by the sampler applies to every clone
+    of this model for the duration of the sampling call.
+    """
+
+    def __init__(self, inner, adapters, hyper):
+        self.inner = inner
+        self.adapters = adapters
+        self.hyper = hyper
+
+    def set_fused(self, enabled):
+        for adapter in self.adapters:
+            adapter.fused = bool(enabled)
+
+    def inject(self, patcher):
+        self.inner.inject(patcher)
+        if self.hyper is not None:
+            self.hyper.to(comfy.model_management.get_torch_device())
+
+    def eject(self, patcher):
+        self.inner.eject(patcher)
+        if self.hyper is not None:
+            self.hyper.to("cpu")
+            self.hyper._core_cache = None
 
 
 def _check_moss(model):
@@ -89,25 +119,15 @@ def _load_nara(model, tensors, meta, strength_model):
     )
 
     manager = BypassInjectionManager()
+    adapters = []
     for weight_key, parts in groups.items():
         parts.sort(key=lambda p: p[0][1] if p[0] is not None else 0)
         adapter = NaraAdapter(loaded_keys, parts, hyper, variant, _export_sigma(meta))
+        adapters.append(adapter)
         manager.add_adapter(weight_key, adapter, strength=strength_model)
     inner = manager.create_injections(model.model)[0]
-
-    def inject(patcher):
-        inner.inject(patcher)
-        if hyper is not None:
-            hyper.to(comfy.model_management.get_torch_device())
-
-    def eject(patcher):
-        inner.eject(patcher)
-        if hyper is not None:
-            hyper.to("cpu")
-            hyper._core_cache = None
-
     m = model.clone()
-    m.set_injections(f"{INJECTION_PREFIX}{uuid.uuid4().hex[:8]}", [PatcherInjection(inject, eject)])
+    m.set_injections(f"{INJECTION_PREFIX}{uuid.uuid4().hex[:8]}", [NaraInjection(inner, adapters, hyper)])
     return m
 
 
@@ -157,6 +177,43 @@ def _has_nara(model):
     return any(k.startswith(INJECTION_PREFIX) for k in model.injections)
 
 
+def _nara_injections(model):
+    return [
+        injection
+        for key, injections in model.injections.items()
+        if key.startswith(INJECTION_PREFIX)
+        for injection in injections
+        if isinstance(injection, NaraInjection)
+    ]
+
+
+class MossNaraFastMode(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="MossNara_FastMode",
+            display_name="Fast Mode (MOSS-Image, fused epilogue)",
+            category="moss_nara",
+            description="Sample the NaRA adapters upstream with the fused epilogue: the DoRA row scale and the up projection accumulate into the layer output in place instead of materialising per-layer temporaries, roughly halving the adapter's extra time. Rounding order changes at bf16-ulp level; disable for the bit-exact path.",
+            inputs=[
+                io.Model.Input("model"),
+                io.Boolean.Input("fused", default=True),
+            ],
+            outputs=[io.Model.Output()],
+        )
+
+    @classmethod
+    def execute(cls, model, fused) -> io.NodeOutput:
+        m = model.clone()
+        m.model_options[MODEL_OPTION_FUSED] = fused
+        if fused:
+            logging.info(
+                "[moss-nara] fast mode: fused epilogue enabled (%d adapters upstream)",
+                sum(len(injection.adapters) for injection in _nara_injections(model)),
+            )
+        return io.NodeOutput(m)
+
+
 class MossNaraKSamplerAdvanced(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -195,6 +252,9 @@ class MossNaraKSamplerAdvanced(io.ComfyNode):
                 return executor(x, timestep, model_options, seed)
 
             m.add_wrapper_with_key(WrappersMP.PREDICT_NOISE, "moss_nara_sigma", sigma_wrapper)
+        injections = _nara_injections(m)
+        for injection in injections:
+            injection.set_fused(model.model_options.get(MODEL_OPTION_FUSED, False))
         try:
             out = nodes.common_ksampler(
                 m, noise_seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image,
@@ -205,6 +265,8 @@ class MossNaraKSamplerAdvanced(io.ComfyNode):
                 force_full_denoise=return_with_leftover_noise == "disable",
             )[0]
         finally:
+            for injection in injections:
+                injection.set_fused(False)
             if nara:
                 set_sigma(None)
         return io.NodeOutput(out)
@@ -245,12 +307,17 @@ class MossNaraKSampler(io.ComfyNode):
                 return executor(x, timestep, model_options, seed)
 
             m.add_wrapper_with_key(WrappersMP.PREDICT_NOISE, "moss_nara_sigma", sigma_wrapper)
+        injections = _nara_injections(m)
+        for injection in injections:
+            injection.set_fused(model.model_options.get(MODEL_OPTION_FUSED, False))
         try:
             out = nodes.common_ksampler(
                 m, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image,
                 denoise=denoise,
             )[0]
         finally:
+            for injection in injections:
+                injection.set_fused(False)
             if nara:
                 set_sigma(None)
         return io.NodeOutput(out)
@@ -346,4 +413,4 @@ class MossNaraBake(io.ComfyNode):
 
 class MossNaraExtension(ComfyExtension):
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [MossNaraLoader, MossNaraKSampler, MossNaraKSamplerAdvanced, MossNaraBake]
+        return [MossNaraLoader, MossNaraKSampler, MossNaraKSamplerAdvanced, MossNaraBake, MossNaraFastMode]

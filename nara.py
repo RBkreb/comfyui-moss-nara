@@ -410,6 +410,23 @@ class NaraAdapter(WeightAdapterBase):
         self._norm_cache = None
         self._norms_cache = None
         self._eye_cache = None
+        # Hot-path metadata: indices into `weights` stay valid when the bypass hook
+        # replaces the tuple with device/dtype copies.
+        self.multiplier = 1.0
+        self._lora = []
+        if variant == "lora":
+            for offset, alpha, idx, _ in self.parts:
+                self._lora.append(
+                    (offset, self._scale(alpha, self._tensors(idx)), idx["lora_up.weight"], idx["lora_down.weight"])
+                )
+            self.rank = self.weights[self._lora[0][3]].shape[0]
+        self._conds = [c for c in self.sora if c.any]
+        self._need_base = any(c.pre for c in self._conds)
+        # Fused epilogue: accumulate the up projection into the layer output instead
+        # of materialising the delta; off by default (rounding order changes).
+        self.fused = False
+        self._core_typed_cache = None
+        self._module = None
 
     @staticmethod
     def _out_features(part):
@@ -454,6 +471,25 @@ class NaraAdapter(WeightAdapterBase):
             raise RuntimeError("NaRA: no sampling sigma set; sample with the NaRA KSampler")
         return _core(self.hyper, _sigma)
 
+    def _core_typed(self, core, dtype, device):
+        """The core in the activation dtype, cached per sigma: the cast is bit-exact
+        and cond/uncond share one core tensor, so each layer casts it once per step."""
+        cache = self._core_typed_cache
+        if cache is None or cache[0] is not core or cache[1] != (dtype, device):
+            cache = (core, (dtype, device), core.to(device=device, dtype=dtype))
+            self._core_typed_cache = cache
+        return cache[2]
+
+    def _lora_hidden(self, x, down_idx, core):
+        """x @ (down C(sigma))^T of one slice, in x's dtype (the 32-wide hot GEMM)."""
+        down = self.weights[down_idx]
+        if down.dtype != x.dtype:
+            down = down.to(x.dtype)
+        hidden = F.linear(x, down)
+        if self.hyper is not None:
+            hidden = hidden @ self._core_typed(core, x.dtype, x.device)
+        return hidden
+
     def _delta(self, x, ts, core, scale):
         """The slice's bypass delta in x's dtype (LoRA keeps the factorized chain)."""
         if self.variant == "lora":
@@ -468,8 +504,39 @@ class NaraAdapter(WeightAdapterBase):
         dw = part_delta(self.variant, ts, core_x, scale, x.dtype)
         return F.linear(x, dw)
 
+    def _add_delta(self, x, base_out):
+        """Fused NaRA: each slice's up GEMM accumulates into the base output, one
+        read/write of the activation instead of a separate delta tensor."""
+        core = self._core_at(self.rank, x.device)
+        for offset, scale, up_idx, down_idx in self._lora:
+            up = self.weights[up_idx]
+            if up.dtype != x.dtype:
+                up = up.to(x.dtype)
+            hidden = self._lora_hidden(x, down_idx, core).view(-1, up.shape[1])
+            ys = base_out if offset is None else base_out.narrow(-1, offset[1], offset[2])
+            ys.view(-1, ys.shape[-1]).addmm_(hidden, up.T, beta=1.0, alpha=scale * self.multiplier)
+        return base_out
+
     def h(self, x, base_out):
-        m = getattr(self, "multiplier", 1.0)
+        m = self.multiplier
+        if self.variant != "lora":
+            return self._h_generic(x, base_out, m)
+        core = self._core_at(self.rank, x.device)
+        out = None
+        for offset, scale, up_idx, down_idx in self._lora:
+            up = self.weights[up_idx]
+            if up.dtype != x.dtype:
+                up = up.to(x.dtype)
+            delta = F.linear(self._lora_hidden(x, down_idx, core), up) * (scale * m)
+            if offset is None:
+                out = delta if out is None else out + delta
+            else:
+                if out is None:
+                    out = torch.zeros_like(base_out)
+                out.narrow(-1, offset[1], offset[2]).add_(delta)
+        return out
+
+    def _h_generic(self, x, base_out, m):
         out = None
         for offset, alpha, idx, _ in self.parts:
             ts = self._tensors(idx)
@@ -484,25 +551,29 @@ class NaraAdapter(WeightAdapterBase):
         return out
 
     def bypass_forward(self, org_forward, x, *args, **kwargs):
-        m = getattr(self, "multiplier", 1.0)
-        conds = [c for c in self.sora if c.any]
-        need_base = any(c.pre for c in conds)
+        m = self.multiplier
+        conds = self._conds
         if self.has_dora:
             plain = self._forward_plain(org_forward, x, *args, **kwargs)
             # A DoRA path's output is not base + delta, so fall back to the raw
             # module forward: it holds no adapter of this one, only an earlier
             # stack member.
-            base = org_forward(x, *args, **kwargs) if need_base else None
+            base = org_forward(x, *args, **kwargs) if self._need_base else None
         else:
             base_out = org_forward(x, *args, **kwargs)
-            # the adapter's own allocations pause the model's malloc graph, as
-            # kitchen ops do, or every step re-records/breaks
-            with comfy.model_prefetch.pause_malloc_graph():
-                delta = self.h(x, base_out)
-                plain = base_out + delta
-                # Pre-Diag scales the base output and leaves the delta at full
-                # strength; reuse the one delta instead of recomputing h.
-                base = plain - delta if need_base else None
+            if self.fused and self.variant == "lora" and not self._need_base:
+                with comfy.model_prefetch.pause_malloc_graph():
+                    plain = self._add_delta(x, base_out)
+                base = None
+            else:
+                # the adapter's own allocations pause the model's malloc graph, as
+                # kitchen ops do, or every step re-records/breaks
+                with comfy.model_prefetch.pause_malloc_graph():
+                    delta = self.h(x, base_out)
+                    plain = base_out.add_(delta)
+                    # Pre-Diag scales the base output and leaves the delta at full
+                    # strength; reuse the one delta instead of recomputing h.
+                    base = plain - delta if self._need_base else None
         if not conds:
             return plain
         if len(conds) == 1 and self.parts[0][0] is None:
@@ -522,15 +593,21 @@ class NaraAdapter(WeightAdapterBase):
         return result.to(plain.dtype)
 
     def _forward_plain(self, org_forward, x, *args, **kwargs):
-        core = self._core_at(
-            rank_of(self.variant, self._tensors(self.parts[0][2])), x.device
-        )
-        m = getattr(self, "multiplier", 1.0)
+        if self.variant == "lora":
+            core = self._core_at(self.rank, x.device)
+        else:
+            core = self._core_at(
+                rank_of(self.variant, self._tensors(self.parts[0][2])), x.device
+            )
+        m = self.multiplier
         # org_forward may be another bypass hook when adapters stack; the DoRA
         # norm reads the raw module's weight (earlier deltas are not folded in)
-        module = org_forward.__self__
-        while not hasattr(module, "weight") and hasattr(module, "original_forward"):
-            module = module.original_forward.__self__
+        module = self._module
+        if module is None:
+            module = org_forward.__self__
+            while not hasattr(module, "weight") and hasattr(module, "original_forward"):
+                module = module.original_forward.__self__
+            self._module = module
         if self.variant == "lora":
             if self.wd_on_out:
                 return self._dora_out(org_forward, x, module, core, m, args, kwargs)
@@ -613,30 +690,31 @@ class NaraAdapter(WeightAdapterBase):
         """y + m ((r - 1) Wx + r dy), r = mag / ||W + dW(sigma)|| per output row.
         The norm is fp32; the epilogue runs in the activation dtype with r folded
         into a row scale on y and on the up factor (the output is rounded to that
-        dtype anyway)."""
+        dtype anyway). The base output is updated in place — no per-part temporary
+        the size of the activation. `fused` lets the up GEMM accumulate straight
+        into it through addmm instead of materialising dy."""
         y = org_forward(x, *args, **kwargs)
         with comfy.model_prefetch.pause_malloc_graph():
-            ratios = self._norms(module, x.device, core)
-            out = None
-            for (offset, alpha, idx, _), r in zip(self.parts, ratios):
-                ts = self._tensors(idx)
-                scale = self._scale(alpha, ts)
+            for (offset, scale, up_idx, down_idx), r in zip(self._lora, self._norms(module, x.device, core)):
                 a = (1 + m * (r - 1)).to(y.dtype)
                 b = (m * r).to(y.dtype)
-                up = ts["lora_up.weight"] * b.to(ts["lora_up.weight"].dtype).reshape(-1, 1)
-                dy = self._delta(x, {**ts, "lora_up.weight": up}, core, scale)
+                up = self.weights[up_idx]
+                up = up * b.to(up.dtype).reshape(-1, 1)
+                if up.dtype != x.dtype:
+                    up = up.to(x.dtype)
+                hidden = self._lora_hidden(x, down_idx, core)
                 ys = y if offset is None else y.narrow(-1, offset[1], offset[2])
-                part = ys * a + dy
+                ys.mul_(a)
+                if self.fused:
+                    ys.view(-1, ys.shape[-1]).addmm_(
+                        hidden.view(-1, hidden.shape[-1]), up.T, beta=1.0, alpha=scale
+                    )
+                else:
+                    ys.add_(F.linear(hidden, up).mul_(scale))
                 if module.bias is not None:
                     bs = module.bias if offset is None else module.bias.narrow(0, offset[1], offset[2])
-                    part = part - (m * (r - 1)).to(y.dtype) * bs.to(y.dtype)
-                if offset is None:
-                    out = part if out is None else out + part
-                else:
-                    if out is None:
-                        out = torch.zeros_like(y)
-                    out.narrow(-1, offset[1], offset[2]).add_(part)
-            return out
+                    ys.sub_((m * (r - 1)).to(y.dtype) * bs.to(y.dtype))
+            return y
 
     def _dora_in(self, org_forward, x, module, core, m, args, kwargs):
         """W'x = (W + dW)(c x), c = mag / ||W + dW(sigma)|| per input column; one

@@ -15,12 +15,13 @@ git clone https://github.com/RBkreb/comfyui-moss-nara.git
 
 | 节点 | 作用 |
 |------|------|
-| **Adapter Loader (MOSS-Image, NaRA auto)** | 自动识别适配器类型：含 `nara_hyper.*` **或** SORA 张量的文件以 bypass 方式加载；其余普通 lora/loha/lokr 走 ComfyUI 原生 patch |
+| **Adapter Loader (MOSS-Image, NaRA auto)** | 自动识别适配器类型：含 `nara_hyper.*` **或** SORA 张量的文件以 bypass 方式加载；其余普通 lora/loha/lokr 视作 ComfyUI 原生加载路径 |
 | **NaRA KSampler (MOSS-Image)** | 原生标准 KSampler 的等价物。上游模型含 NaRA 时以每步 sigma 计算超网络；不含 NaRA 时行为与原生 KSampler 一致 |
 | **NaRA KSampler Advanced (MOSS-Image)** | 原生高级 KSampler 的等价物。上游模型含 NaRA 时以每步 sigma 计算超网络；不含 NaRA 时行为与原生 KSamplerAdvanced 一致 |
+| **Fast Mode (MOSS-Image, fused epilogue)** | 采样加速开关：DoRA/NaRA 的 delta 通过 `addmm` 累加进层输出。adapter 额外开销约减半；精度损失约 bf16 ulp 级 |
 | **Adapter Bake (MOSS-Image, fixed sigma)** |  固定 NaRA sigma 制成普通适配器：核心折入 up 因子，DoRA 幅度换算为 ComfyUI 的归一化语义。**SORA 无法兼容**，会逐层告警并丢弃 SORA 分量 |
 
-用法：`Moss Loader -> Adapter Loader -> NaRA KSampler`。
+用法：`Moss Loader -> Adapter Loader -> NaRA KSampler`；需要提速时在 Adapter Loader 与采样器之间插入 `Fast Mode`。
 
 ## 环境
 - **ComfyUI ≥ v0.42.0**
@@ -29,7 +30,7 @@ git clone https://github.com/RBkreb/comfyui-moss-nara.git
 
 - `strength_model` 与 LoRA strength 一致；DoRA 的 multiplier 插值与 trainer 相同。
 - **SORA 参数**（`sora_C` / `sora_D` / `sora_diag` / `sora_s_p0`）与 factor 张量分开解析。文件带 SORA 但无 `nara_hyper.*`走动态路径，此时 C(σ)=I：Pre-Diag / Post-Ortho 只读 base 输出与 rank 因子。
-
+- **Fast Mode** 只影响 NaRA bypass 适配器的 LoRA 路径（含 DoRA）；SORA 与 LoHa/LoKr 变体无影响。
 
 ## 自检脚本
 
